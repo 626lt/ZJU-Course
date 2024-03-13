@@ -123,3 +123,48 @@ AVL树与红黑树的对比：
 | Insertion | $\leq2$     | $\leq2$ |
 | Deletion  | $O(\log N)$ | $\leq3$ |
 
+## B+树
+
+### 定义
+
+阶数为M的B+树满足一下子结构性质：
+
+1. 根结点要么是叶子结点，或者有两个到M个儿子。
+2. 所有非叶子结点（除了根）有$\lceil M/2 \rceil$到M个儿子。（对于每个结点，包含最多M个指针）
+3. 所有叶子都在同一个深度。
+   假设所有非根叶子也有$\lceil M/2 \rceil$到M个儿子。可以理解为所有的叶子都有$\lceil M/2 \rceil$到M个键值。
+
+!!! example
+
+    ![alt text](image-13.png)
+    所有叶子结点内存储了我们真正要查询的数据。对于非叶子结点（内部结点）的键值，第一个键值表示其从左往右数的第二棵子树中的最小键值。比如说25表示的是第二棵子树中最小的键值，31表示的是第三棵子树中最小的键值，41表示的是第四棵子树中最小的键值。注意这里是**子树中的键值**。对于根结点而言，21表示的是第二棵子树中最小值，48表示第三棵子树中最小值，72表示第四棵子树中的最小值。
+
+!!! note
+
+    1. B+树的非叶子结点的结构是至多M个指针和M-1个键值。
+    2. B+树的叶子结点有至少$\lceil M/2\rceil$,至多$M$个键值。（这是其中的一种定义）
+
+### 操作
+
+#### 1.查找
+
+#### 2.插入
+
+    Btree Insert(ElementType X, Btree T)
+    {
+        Search from root to leaf for X and find the proper leaf node;
+        Insert X;
+        while(this node has M+1 keys){
+            split it into 2 nodes with M/2 keys;//
+            if(this node is the root)
+                create a new root with two children;
+            check its parent;
+        }
+    }
+
+
+#### 3.删除
+
+!!! note
+
+    M的最佳选择是3或4。B+树的偏序关系相邻的数据在磁盘上的位置也是相邻的，这对磁盘的IO相对友好。
