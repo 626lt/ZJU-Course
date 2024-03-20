@@ -1,0 +1,6 @@
+Key 5 is duplicated
+Key 13 is duplicated
+Key 3 is duplicated
+[7,12]
+[3][10][14]
+[1,2][3,5][7,9][10,11][12,13][14,15]
