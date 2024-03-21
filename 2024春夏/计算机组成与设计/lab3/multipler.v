@@ -42,20 +42,22 @@ module multiplier(
         // Why not "else"?
         // 你需要在这里处理“一次”运算与移位
         if(res[0] == 1'b1) begin
-            res[63:32] <= res[63:32] + multiplicand;
+            res[63:32] = res[63:32] + multiplicand;
         end
         res = res >> 1;
         cnt = cnt + 1;
         end
 
         // 填写 cnt 相关的内容，用 cnt 查看当前运算是否结束
-        if(cnt == 6'b100000 ) begin
+<<<<<<< HEAD
+        if(cnt == 0  ) begin
+=======
+        if(cnt == 0 ) begin
+>>>>>>> 4746b90719d6fb7f51a6c8f01954c2631c3f483a
         // 得到结果
             finish <= 1'b1;
             state <= 0;
-            if (sign) begin
-                res <= ~res + 1;
-            end
+            assign res <= (sign == 1'b1) ? ~res + 1 : res;
         end 
     end
 
