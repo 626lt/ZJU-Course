@@ -1,7 +1,51 @@
+![alt text](image-3.png)
+
+### Eight Great Ideas
+
+1. Design for Moore’s Law
+2. Use Abstraction to Simplify Design 
+3. Make the Common Case Fast 
+4. Performance via Parallelism 并行性
+5. Performance via Pipelining 流水线
+6. Performance via Prediction 预测
+7. Hierarchy of Memories 层次化的存储结构
+   ![alt text](image-4.png)
+8. Dependability via Redundancy 通过冗余达成的可靠性，即备份
+
+![alt text](image-5.png)
+
+
+## Performance
+
++ Response time: how long it takes to do a task
++ Throughput（吞吐量）: total work done per unit time
+
+Define Performance = 1 / Execution Time
+
+### Execution Time
+
+* Elapsed Time  
+Total response time, including all aspects ***e.g.*** Processing, I/O, OS overhead, idle time.  
+* CPU Time    
+Discounts I/O time, other jobs’ shares  
+这里我们只考虑 CPU 时间
+
+
 ### CPU Clocking
 
+* Clock period: duration of a clock cycle.  
+用时钟周期代替具体的秒数。 
+* Clock frequency(rate): cycles per second.  
+  
+  $$
+\begin{align*} 
+CPU\ Time &= CPU\ Clock\ Cycles \times Clock\ Cycle\ Time \\
+&=\dfrac{ CPU\ Clock\ Cycles}{Clock\ Rates}
+\end{align*}
+$$ 
+
 + 由恒定速率时钟控制的数字硬件的操作
-+ ![alt text](image.png)
+  ![alt text](image.png)
 + Clock period: duration of one clock cycle
   + e.g. 250ps = 0.25ns = $250 * 10^-12$ s
 + Clock frequency(rate): cycles per second
@@ -15,6 +59,23 @@
   + 减少时钟周期数
   + 提高时钟频率
   + 硬件设计者必须经常权衡时钟速率和周期数
+  $$
+  \begin{align*}
+  Clock\ Cycles &= Instruction\ Count \times Cycles\ per\ Instruction(CPI)\\
+  CPU\ Time & = Instruction\ Count \times CPI\times CPI\ Cycle\ Time\\
+  & = \dfrac{Instruction\ Count \times CPI}{Clock\ Rate}
+  \end{align*}
+  $$
+CPI is determined by CPU hardware.  
+如果不同指令有不同的 CPI, 我们可以用 Average CPI. 
+综上, $CPU\ Time = \dfrac{Instructions}{Program}\times \dfrac{Clock\ Cycles}{Instruction}\times \dfrac{Seconds}{Clock Cycle}$ 
+
+Performance depends on  
+
+* Algorithm: affects IC, possibly CPI
+* Programming language: affects IC, CPI
+* Compiler: affects IC, CPI
+* Instruction set architecture
 
 !!! example
 
@@ -68,7 +129,7 @@ $$
 T_{\text{improved}} = \dfrac{T_{\text{affected}}}{\text{improvement factor}} + T_{\text{unaffected}}
 $$
 
-单独对某一方面提升，不能使整体获得同样幅度的提升
+单独对某一方面提升，不能使整体获得同样幅度的提升;比如对某一方面提升90%，并不能让整体也提升90%。
 
 Corollary: make the common case fast.
 
