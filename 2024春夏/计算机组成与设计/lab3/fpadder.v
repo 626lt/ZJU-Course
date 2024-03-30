@@ -1,11 +1,11 @@
-module Fadder(
+module fpadder(
         input clk,
         input rst,
         input [31:0] A,
         input [31:0] B,
         input start,
-        output [31:0] result,
-        output finish
+        output reg [31:0] result,
+        output reg finish
     );
     reg [2:0] state;
     reg sign,sign1,sign2;
