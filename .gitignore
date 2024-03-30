@@ -7,3 +7,7 @@
 *.str
 
 __MACOSX
+
+.DS_Store
+
+*.ppt
