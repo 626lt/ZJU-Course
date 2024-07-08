@@ -1,2 +1,0 @@
-# Inverted File Index
-

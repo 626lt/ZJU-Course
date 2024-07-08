@@ -1,0 +1,65 @@
+\documentclass[12pt, a4paper, oneside]{ctexart}
+% \usepackage{hwopt}
+% \usepackage{amsmath}	% Package for AMS
+% \usepackage{amsthm}     % Package for AMS-therom
+% \usepackage{amssymb}
+% \usepackage{bm}
+
+\usepackage{amsmath, amsthm, amssymb, bm, color, framed, graphicx, hyperref, mathrsfs}
+\title{Coursework (1) for \emph{Database System}}
+\author{Tao Liu \\ 3220103422}
+\date{Feb. 27, 2023}
+\linespread{1.5}
+\definecolor{shadecolor}{RGB}{241, 241, 255}
+\newcounter{problemname}
+\newenvironment{problem}{\begin{shaded}\stepcounter{problemname}\par\noindent\textbf{Quesion \arabic{problemname}. }}{\end{shaded}\par}
+\newenvironment{solution}{\par\noindent\textbf{Solution. }}{\par}
+\newenvironment{note}{\par\noindent\textbf{题目\arabic{problemname}的注记. }}{\par}
+
+\begin{document}
+\maketitle
+
+\begin{problem}
+    List four significant differences between a file-processing system and a DBMS.
+\end{problem}
+\begin{solution}
+    \begin{enumerate}
+        \item \textbf{原子性：} 在文件处理系统中很难保证原子性，而在DBMS中，很容易保证原子性。
+        \item \textbf{并发访问：} 在文件处理系统中，很难管理对数据的并发访问。相比之下，使用DBMS更容易处理并发访问异常。 
+        \item \textbf{安全性：} 在大多数DBMS中都有安全性机制，包括用户的概念和多用户访问的机制，而在文件处理系统中，很难保证数据的安全性，也没有用户权限的授权。 
+        \item \textbf{数据冗余:} 在文件处理系统中，数据冗余是很难避免的，而在DBMS中，可以通过一些手段来避免数据冗余，其设计目的之一就是减少数据冗余。
+    \end{enumerate}
+\end{solution}
+
+\begin{problem}
+    Explain the concept of physical data independence and its importance in database systems.
+\end{problem}
+\begin{solution}
+    物理数据的独立性是指能够在不改变逻辑模式的情况下修改物理模式。其重要性在于数据库的应用程序是依赖于逻辑模式的，物理模式的改变不影响逻辑模式。其次是隐藏物理层中用于高效处理数据的复杂数据结构。
+\end{solution}
+
+\begin{problem}
+    List ﬁve responsibilities of a database-management system. For each responsibility, explain the problems that would arise if the responsibility were not discharged.
+\end{problem}
+\begin{solution}
+    \begin{enumerate}
+        \item \textbf{保障数据安全：} 出现数据泄露，越权限访问等等可能会造成更严重后果的事情。
+        \item \textbf{高效读取数据：} 在传统的文件管理系统中，存取数据困难，需要一个新的程序来存取每个文件。
+        \item \textbf{保障数据完整：} 不履行会导致存储的数据发生缺失。
+        \item \textbf{保障原子性：} 不履行会导致数据的不一致。
+        \item \textbf{防止并发访问异常：} 需要解决并发访问的异常情况。
+    \end{enumerate}    
+\end{solution}
+
+\begin{problem}
+    Describe at least three tables that might be used to store information in a social- networking system such as Facebook.
+\end{problem}
+\begin{solution}
+    \begin{enumerate}
+        \item \textbf{用户表:} 包含用户的昵称，ID，性别，邮箱，电话号码，住址等。
+        \item \textbf{朋友圈表：} 类似朋友圈的公开空间发表的各种博文的数据。
+        \item \textbf{交流信息表：} 包含两个用户交流的信息数据。
+    \end{enumerate}
+\end{solution}
+
+\end{document}

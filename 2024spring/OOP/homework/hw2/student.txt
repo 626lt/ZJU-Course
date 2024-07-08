@@ -1,0 +1,7 @@
+cheng math 9 phy 5 cs 8
+wang math 10 phy 2
+kun phy 10 chi 10
+si math 7 phy 6
+li phy 3 eng 10
+chen cs 9 eng 10 math 8 phy 7
+liu ai 10 cs 10 eng 10 math 10 phy 10 ee 10

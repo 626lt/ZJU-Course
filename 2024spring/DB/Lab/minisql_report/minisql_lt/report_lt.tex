@@ -1,0 +1,2701 @@
+%!TeX program = xelatex
+\documentclass[12pt,hyperref,a4paper,UTF8]{ctexart}
+\usepackage{zjureport}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\definecolor{cmdbg}{rgb}{0.92,0.92,0.92}
+%%-------------------------------正文开始---------------------------%%
+\begin{document}
+
+%%-----------------------封面--------------------%%
+\cover
+
+\thispagestyle{empty} % 首页不显示页码
+
+%%--------------------------目录页------------------------%%
+\newpage
+\tableofcontents
+
+%%------------------------正文页从这里开始-------------------%
+\newpage
+
+
+\subsection*{个人完成部分}
+Lab1及bonus，Lab2，Lab3，系统整体功能调试。完善了Lab2，Lab3的测试用例。
+
+\section{DISK AND BUFFER POOL MANAGER}
+
+\subsection{Disk Manager summary}
+
+为了管理数据库中的文件，我们需要实现一个对磁盘进行读写的类 DiskManager，它的功能是对数据中的page（基本数据单元）进行allocation和 de allocation，执行从磁盘中进行读写page的操作。除了存储数据的数据页，我们还需要一些元数据来帮助和加速数据页的管理，于是位图页就自然的出现了。我们将一个位图页和它所管理的一段连续的数据页称作数据库文件中的一个分区（extent）。为了提高存储的容量，我们使用一个额外的元信息页来存储各个分区的信息。这种套娃的方式可以使磁盘文件能够维护更多的数据页信息。下面我们依次实现DiskManager中的各个部分，并对其进行测试。
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=1\linewidth]{figures/disk_data.png}
+    \caption{Disk data}
+    \label{fig:enter-label}
+\end{figure}
+
+\subsection{Bitmap page}
+
+首先是位图页的实现。位图页的大小与数据页的大小一致，如\ref{fig:bitmap}所示，位图页由Bitmap Page Meta 和 Bitmap Content 两部分组成。Bitmap Page Meta就是位图页的元数据，含当前已经分配的页的数量（page\_allocated\_）以及下一个空闲的数据页(next\_free\_page\_)。Bitmap Content使用char数组来记录数据，其容量大小是 \verb|MAX_CHARS = PageSize - 2 * sizeof(uint32_t)|，每个bit的含义是对应的页是否被分配，一个char的大小是8bits，位图页对外提供分配、回收数据页和判断数据页是否可用的接口，内部实现是对上述数组的管理，以下是各个接口的具体实现。
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=1\linewidth]{Bitmap_page.png}
+    \caption{Bitmap page}
+    \label{fig:bitmap}
+\end{figure}
+
+\paragraph{AllocatePage}
+设置相应的\verb|next_free_page|，并更新\verb|free_index|来利用离散空间，返回一个bool值来说明是否分配成功，并将分配的页号返回。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+template <size_t PageSize>
+bool BitmapPage<PageSize>::AllocatePage(uint32_t &page_offset) { 
+  if(IsPageFree(next_free_page_)){
+    bytes[next_free_page_ / 8] |= (1 << (next_free_page_ % 8)); // 把指定位设为1
+    page_offset = next_free_page_;
+    page_allocated_++;
+    uint32_t free_index = 0;
+    while (!IsPageFree(free_index) && free_index < GetMaxSupportedSize() - 1)
+    {
+      free_index++;
+    }
+    next_free_page_ = free_index;
+    return true;
+  }
+  return false;
+}
+\end{minted}
+
+\paragraph{DeAllocatePage}
+DeAllocatePage 与 AllocatePage 相对，将输入的 page\_offset 释放，更新 bitmap page的信息，并更新next\_free\_page。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+template <size_t PageSize>
+bool BitmapPage<PageSize>::DeAllocatePage(uint32_t page_offset) {
+  if(IsPageFree(page_offset)){
+    return false;
+  }
+  bytes[page_offset / 8] &= ~(1 << (page_offset % 8)); // 把指定位设为0
+  page_allocated_--;
+  if(page_offset < next_free_page_){
+    next_free_page_ = page_offset;
+  }
+  return true;
+}
+\end{minted}
+
+\paragraph{IsPageFree}
+访问位图页信息，找到对应的bit位，根据信息判断是否空闲。需要注意的是应当判断 page\_offset的有效性。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+template <size_t PageSize>
+bool BitmapPage<PageSize>::IsPageFree(uint32_t page_offset) const {
+  if (page_offset >= GetMaxSupportedSize())
+  {
+    LOG(ERROR) << "page_offset is out of range";
+    return false;
+  }
+  return IsPageFreeLow(page_offset / 8, page_offset % 8);
+}
+
+template <size_t PageSize>
+bool BitmapPage<PageSize>::IsPageFreeLow(uint32_t byte_index, uint8_t bit_index) const {
+  return (bytes[byte_index] & (1 << bit_index)) == 0;
+}
+\end{minted}
+
+\subsection{Disk Manager}
+
+DiskManager具有向磁盘读写物理页，分配和回收页的功能。为了更好地管理数据，我们在前面设置了元数据页，但对于上层的程序而言，数据管理器提供的应当是连续的数据页，即逻辑页号。因此我们需要在这里对逻辑页和物理页进行映射，使得上层能够无感知地获得数据页。映射示意图\ref{fig:phy-log}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=1\linewidth]{figures/phy-log.png}
+    \caption{phy-log}
+    \label{fig:phy-log}
+\end{figure}
+
+\paragraph{MapPageId}
+对输入的逻辑页号返回其物理页号，按照图\ref{fig:phy-log}的映射完成。这个函数将在物理页的读写中被调用。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+page_id_t DiskManager::MapPageId(page_id_t logical_page_id) {
+  return 1 + logical_page_id / BITMAP_SIZE * (BITMAP_SIZE + 1) + 1 + logical_page_id % BITMAP_SIZE;
+}
+\end{minted}
+
+\paragraph{IsPageFree}
+根据逻辑页号找出该数据页对应的位图页的物理页号，调用位图页的函数来判断是否free,需要考虑计算出的物理页号是否有效，如果是无效的超出已经分配的范围，那直接返回true即可。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+bool DiskManager::IsPageFree(page_id_t logical_page_id) {
+  BitmapPage<PAGE_SIZE>* bitmap_page = new BitmapPage<PAGE_SIZE>();
+  uint32_t extent_id = logical_page_id / BITMAP_SIZE;
+  uint32_t page_offset = logical_page_id % BITMAP_SIZE;
+  page_id_t bitmap_page_id = 1 + extent_id * (BITMAP_SIZE + 1);
+  // if the extent_id is larger than the number of extents, then the page is free
+  if (extent_id >= reinterpret_cast<DiskFileMetaPage*>(meta_data_)->num_extents_)
+  {
+    return true;
+  }
+  ReadPhysicalPage(bitmap_page_id,reinterpret_cast<char*>(bitmap_page));
+  bool is_free = bitmap_page->IsPageFree(page_offset);
+  delete bitmap_page;
+  return is_free;
+}
+\end{minted}
+
+\paragraph{AllocatePage}
+
+这是磁盘管理器的分配页实现，思路是先找到一个空闲的页，在磁盘元数据页的定义中我们保留了已经分配的页数，总共的extent数以及每个extent中已经被使用的页数。那么在读取磁盘中的元数据页后，我们通过访问每个extent中已经被使用页数的数组可以找到目前已经分配好的extent中是否存在空闲页，然后调用位图页的allocate page函数进行分配。如果目前所有的页都已经被分配，说明我们需要再新建一个extent，然后分配页。同时需要更新元数据页中的数据，并写回磁盘，具体实现如下：
+
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+page_id_t DiskManager::AllocatePage() {
+  // read meta page
+  DiskFileMetaPage* meta_page = reinterpret_cast<DiskFileMetaPage*>(meta_data_);
+  if(meta_page->num_allocated_pages_ == MAX_VALID_PAGE_ID){
+    return INVALID_PAGE_ID;
+  }
+  // find the first free page
+  // if there is free page in existed page
+  for(uint32_t i = 0;i < meta_page->num_extents_;i++){
+    if(meta_page->GetExtentUsedPage(i) < BITMAP_SIZE){
+      BitmapPage<PAGE_SIZE>* bitmap_page = new BitmapPage<PAGE_SIZE>();
+      ReadPhysicalPage(1 + i * (BITMAP_SIZE + 1),reinterpret_cast<char*>(bitmap_page));
+      uint32_t page_offset;
+      bool res = bitmap_page->AllocatePage(page_offset);
+      ASSERT(res,"Allocate page failed");
+      if(res){
+        meta_page->num_allocated_pages_++;
+        meta_page->extent_used_page_[i]++;
+        WritePhysicalPage(1 + i * (BITMAP_SIZE + 1),reinterpret_cast<char*>(bitmap_page));
+        return i * BITMAP_SIZE + page_offset;
+      }
+    }
+  }
+  // create a new extent
+  BitmapPage<PAGE_SIZE>* bitmap_page = new BitmapPage<PAGE_SIZE>();
+  uint32_t page_offset = 0;
+  bitmap_page->AllocatePage(page_offset);
+  WritePhysicalPage(1 + meta_page->num_extents_ * (BITMAP_SIZE + 1),reinterpret_cast<char*>(bitmap_page));
+  meta_page->num_allocated_pages_++;
+  meta_page->extent_used_page_[meta_page->num_extents_]++;
+  meta_page->num_extents_++;
+  return (meta_page->num_extents_ - 1) * BITMAP_SIZE + page_offset;
+}
+\end{minted}
+
+\paragraph{DeAllocatePage}
+这部分要做的事情是找到相应的数据页，调用Bitmap page的DeAllocatePage，更新元数据，写回磁盘，具体实现如下：
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+void DiskManager::DeAllocatePage(page_id_t logical_page_id) {
+  uint32_t extent_id = logical_page_id / BITMAP_SIZE;
+  page_id_t bitmap_page_id = 1 + extent_id * (BITMAP_SIZE + 1);
+
+  DiskFileMetaPage* meta_page = reinterpret_cast<DiskFileMetaPage*>(meta_data_);
+  BitmapPage<PAGE_SIZE>* bitmap_page = new BitmapPage<PAGE_SIZE>();
+
+  ReadPhysicalPage(bitmap_page_id,reinterpret_cast<char*>(bitmap_page));
+  uint32_t page_offset = logical_page_id % BITMAP_SIZE;
+  bool res = bitmap_page->DeAllocatePage(page_offset);
+  if(res){
+    meta_page->num_allocated_pages_--;
+    meta_page->extent_used_page_[extent_id]--;
+    WritePhysicalPage(bitmap_page_id,reinterpret_cast<char*>(bitmap_page));
+  }else{
+    LOG(ERROR) << "Deallocate page failed." << logical_page_id;
+  }
+}
+\end{minted}
+
+\subsection{Buffer pool manager}
+Buffer pool manager 是提供给上层调用，用于数据读写管理的接口。功能需求是
+\begin{enumerate}
+    \item \verb|Page *FetchPage(page_id_t page_id);|:根据逻辑页号获取对应的数据页，如果该数据页不在内存中，则需要从磁盘中进行读取；
+    \item \verb|BufferPoolManager::NewPage(&page_id)|:分配一个新的数据页，并将逻辑页号于\verb|page_id|中返回；
+    \item \verb|BufferPoolManager::UnpinPage(page_id, is_dirty)|:取消固定一个数据页；
+    \item \verb|BufferPoolManager::FlushPage(page_id)|:将数据页转储到磁盘中；
+    \item \verb|BufferPoolManager::DeletePage(page_id)|:释放一个数据页；
+\end{enumerate}
+
+\subsubsection{Buffer pool replacement algorithm}
+为了保证在buffer pool没有空闲页的情况下可以正常的使用，我们需要一个替换单元，这里使用LRU替换算法来决定哪一页被替换，同时还实现了Bonus：Clock Replacer并为其实现测试用例。以下是两种替换算法的实现：
+
+\paragraph{Least Recently Used Replacer}~{}
+LRU替换算法是将最近最少被访问的元素作为被替代的对象，因此实现时我们可以通过一个有序列表，将每次使用后的都换到列表的头部，那么列表的尾部就是我们所需要的对象。我们使用了list来存保证有序性，用unordered\_map来加快查询。
+
+\paragraph{Victim} 
+替换（即删除）与所有被跟踪的页相比最近最少被访问的页将其页帧号（即数据页在Buffer Pool的Page数组中的下标）存储在输出参数frame\_id中输出并返回true，如果当前没有可以替换的元素则返回false；
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+bool LRUReplacer::Victim(frame_id_t *frame_id) {
+  if (lru_list_.empty()) {
+    return false;
+  }
+  *frame_id = lru_list_.back();
+  lru_list_.pop_back();
+  lru_list_map_.erase(*frame_id);
+  return true;
+}
+\end{minted}
+
+\paragraph{Pin}
+将数据页固定使之不能被Replacer替换，即从lru\_list\_中移除该数据页对应的页帧。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+void LRUReplacer::Pin(frame_id_t frame_id) {
+  auto it = lru_list_map_.find(frame_id);
+  if(it != lru_list_map_.end()){
+    lru_list_.erase(it->second);
+    lru_list_map_.erase(it);
+  }
+}
+\end{minted}
+
+\paragraph{UnPin}
+将数据页解除固定，放入lru\_list\_中，使之可以在必要时被Replacer替换掉。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+void LRUReplacer::Unpin(frame_id_t frame_id) {
+  auto it = lru_list_map_.find(frame_id);
+  if(it == lru_list_map_.end()){
+    lru_list_.push_front(frame_id);
+    lru_list_map_[frame_id] = lru_list_.begin();
+  }
+}
+\end{minted}
+
+\paragraph{Clock Replacer}~{}
+这种替换方式采用标记，对每个元素进行标记，然后每次选择替换时进行一次遍历，对找到的每个元素查看标记，如果标记是1就变为0，如果标记是0就替换出，每次查询是上次结束的位置开始，对新入队的元素标记是1。类的成员变量有list用于存储替换页和map用于存储标记状态。
+  
+\paragraph{Victim} 
+替换（即删除）与所有被跟踪的页相比最近最少被访问的页将其页帧号（即数据页在Buffer Pool的Page数组中的下标）存储在输出参数frame\_id中输出并返回true，如果当前没有可以替换的元素则返回false；
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+bool CLOCKReplacer::Victim(frame_id_t *frame_id) {
+  // if the clock_list is empty, return false
+  if (clock_list.empty()) {
+    return false;
+  }
+  // find the first frame that is not pinned
+  while (clock_status[clock_list.front()] == 1) {
+    clock_list.push_back(clock_list.front());
+    clock_list.pop_front();
+    clock_status[clock_list.back()] = 0;
+  }
+  // return the frame_id
+  *frame_id = clock_list.front();
+  clock_list.pop_front();
+  clock_status.erase(*frame_id);
+  return true;
+}
+\end{minted}
+
+\paragraph{Pin}
+将数据页固定使之不能被Replacer替换，即从lru\_list\_中移除该数据页对应的页帧。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+void CLOCKReplacer::Pin(frame_id_t frame_id) {
+  // if the frame is in the clock_list, then remove it from the clock_list
+  if (clock_status.find(frame_id) != clock_status.end()) {
+    clock_list.remove(frame_id);
+    clock_status.erase(frame_id);
+  }
+}
+
+\end{minted}
+
+\subsubsection{buffer pool manager implementation}
+\paragraph{UnPin}
+将数据页解除固定，放入lru\_list\_中，使之可以在必要时被Replacer替换掉。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+void CLOCKReplacer::Unpin(frame_id_t frame_id) {
+  // if the frame is not in the clock_list, then add it to the clock_list
+  if (clock_status.find(frame_id) == clock_status.end()) {
+    clock_list.push_back(frame_id);
+    clock_status[frame_id] = 1;
+  }else{
+    clock_status[frame_id] = 1;
+  }
+}
+\end{minted}
+
+\paragraph{FetchPage}
+首先尝试在page table中找到要求的page(P)，如果存在就固定它并立刻返回这个Page；如果不存在则需要从free list（优先）或者replacer中找到一个替换页(R)。如果R是脏页，就应当先写回磁盘保证数据的一致性，然后把R从page table中删掉并且插入P，并更新P的元数据，从磁盘中读出数据即可。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+Page *BufferPoolManager::FetchPage(page_id_t page_id) {
+  // 1.     Search the page table for the requested page (P).
+  frame_id_t frame_id = INVALID_FRAME_ID;
+  if(page_table_.find(page_id) != page_table_.end()) {
+    // 1.1    If P exists, pin it and return it immediately.
+    frame_id = page_table_[page_id];
+    pages_[frame_id].pin_count_++;
+    replacer_->Pin(frame_id);
+    return &pages_[frame_id];
+  }else{
+    // 1.2    If P does not exist, find a replacement page (R) from either the free list or the replacer.
+    //        Note that pages are always found from the free list first.
+    if(!free_list_.empty()){
+      frame_id = free_list_.front();
+      free_list_.pop_front();
+    }else{
+      // get from replacer
+      if(!replacer_->Victim(&frame_id)){
+        return nullptr;
+      }
+    }
+    // 2.     If R is dirty, write it back to the disk.
+    if(pages_[frame_id].IsDirty()){
+      FlushPage(pages_[frame_id].GetPageId());
+    }
+    // 3.     Delete R from the page table and insert P.
+    page_table_.erase(pages_[frame_id].GetPageId());
+    page_table_[page_id] = frame_id;
+    // 4.     Update P's metadata, read in the page content from disk, and then return a pointer to P.
+    pages_[frame_id].pin_count_ = 1;
+    pages_[frame_id].page_id_ = page_id;
+    pages_[frame_id].ResetMemory();
+    disk_manager_->ReadPage(page_id,pages_[frame_id].GetData());
+    replacer_->Pin(frame_id);
+    return &pages_[frame_id];
+  }
+}
+\end{minted}
+
+\paragraph{NewPage}
+如果已经没有空闲页（free list和replacer都没有了），就返回空指针；如果还有就取出一个，然后更新元数据，清空页面的原数据，固定并返回page。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+Page *BufferPoolManager::NewPage(page_id_t &page_id) {
+  // 0.   Make sure you call AllocatePage!
+  // 1.   If all the pages in the buffer pool are pinned, return nullptr.
+  if(free_list_.empty() && replacer_->Size() == 0){
+    return nullptr;
+  }
+  // 2.   Pick a victim page P from either the free list or the replacer. Always pick from the free list first.
+  frame_id_t frame_id = INVALID_FRAME_ID;
+  if(!free_list_.empty()){
+    frame_id = free_list_.front();
+    free_list_.pop_front();
+  }else{
+    if(!replacer_->Victim(&frame_id)){
+      return nullptr;
+    }
+  }
+  // if the page get from replacer, we should erase it and get space for the new page.
+  page_table_.erase(pages_[frame_id].GetPageId());
+  // 3.   Update P's metadata, zero out memory and add P to the page table.
+  page_id = AllocatePage();
+  pages_[frame_id].page_id_ = page_id;
+  pages_[frame_id].pin_count_ = 1;
+  pages_[frame_id].is_dirty_ = false;
+  pages_[frame_id].ResetMemory();
+  page_table_[page_id] = frame_id;
+  replacer_->Pin(frame_id);
+  // 4.   Set the page ID output parameter. Return a pointer to P.
+  return &pages_[frame_id];
+}
+\end{minted}
+
+\paragraph{DeletePage}
+找到需要删除的page，如果不存在返回true，如果存在但是仍然被固定，返回false，除此以外这个page可以被删除，从table中删除，reset数据，放回free list。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+bool BufferPoolManager::DeletePage(page_id_t page_id) {
+  // 0.   Make sure you call DeallocatePage!
+  // 1.   Search the page table for the requested page (P).
+  // 1.   If P does not exist, return true.
+  if(page_table_.find(page_id) == page_table_.end()){
+    return true;
+  }else{
+  // 2.   If P exists, but has a non-zero pin-count, return false. Someone is using the page.
+    frame_id_t frame_id = page_table_[page_id];
+    if(pages_[frame_id].GetPinCount() != 0){
+      return false;
+    }else{
+  // 3.   Otherwise, P can be deleted. Remove P from the page table, reset its metadata and return it to the free list.
+      page_table_.erase(page_id);
+      DeallocatePage(page_id);
+      pages_[frame_id].ResetMemory();
+      pages_[frame_id].page_id_ = INVALID_PAGE_ID;
+      pages_[frame_id].pin_count_ = 0;
+      pages_[frame_id].is_dirty_ = false;
+      free_list_.push_back(frame_id);
+      replacer_->Pin(frame_id);
+      return true;
+    }
+  }
+}
+\end{minted}
+
+\paragraph{UnpinPage}
+在pagetable中找到这个页，对是否要写回磁盘进行标记，然后将pin\_count-1，如果pin数为0就把它从replacer中unpin掉。
+
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
+  if (page_table_.find(page_id) == page_table_.end()){
+    return true;
+  }
+  frame_id_t frame_id = page_table_[page_id];
+  if(pages_[frame_id].pin_count_ > 0){
+    pages_[frame_id].pin_count_ --;
+  }
+  pages_[frame_id].is_dirty_ |= is_dirty;
+  if(pages_[frame_id].pin_count_ == 0){
+    replacer_->Unpin(frame_id);
+  }
+  return true;
+}
+\end{minted}
+
+\paragraph{FlushPage}
+找到page，将其写回磁盘，无论是否pin。这是为了保证磁盘数据的一致性。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+bool BufferPoolManager::FlushPage(page_id_t page_id) {
+  if(page_table_.find(page_id) == page_table_.end()){
+    return false;
+  }else{
+    frame_id_t frame_id = page_table_[page_id];
+    disk_manager_->WritePage(page_id,pages_[frame_id].GetData());
+    pages_[frame_id].is_dirty_ = false;
+    return true;
+  }
+}
+\end{minted}
+
+\subsection{test}
+
+使用所给的测试用例进行测试，增加了clock replacer的测试，其测试与LRU测试相同。测试结果如下:
+
+\begin{figure}[!htbp]
+  \centering
+  \begin{subfigure}
+      \centering
+      \includegraphics[width=.8\linewidth]{figures/test1.png}
+      \caption{test1}
+      \label{fig:test1}
+  \end{subfigure}
+
+  \begin{subfigure}
+      \centering
+      \includegraphics[width=.8\linewidth]{figures/test2.png}
+      \caption{test2}
+      \label{fig:test2}
+  \end{subfigure}
+
+  \begin{subfigure}
+      \centering
+      \includegraphics[width=.8\linewidth]{figures/test3.png}
+      \caption{test3}
+      \label{fig:test3}
+  \end{subfigure}
+
+  \begin{subfigure}
+    \centering
+    \includegraphics[width=.8\linewidth]{figures/test4.png}
+    \caption{test4}
+    \label{fig:test4}
+\end{subfigure}
+\end{figure}
+
+本节的测试全都通过，包括bonus的测试。
+
+\pagebreak
+
+\section{RECORD MANAGER}
+
+\subsection{Record design}
+
+我们的记录包含以下几个概念：
+
+\begin{itemize}
+    \item \textbf{Column}：用于定义和表示数据表中的某一个字段，即包含了这个字段的字段名、字段类型、是否唯一等等；
+    \item \textbf{Schema}：用于表示一个数据表或是一个索引的结构。一个Schema由一个或多个的Column构成；
+    \item \textbf{Field}：它对应于一条记录中某一个字段的数据信息，如存储数据的数据类型，是否是空，存储数据的值等等；
+    \item \textbf{Row}： 用于表示一条记录，即一行数据，由多个Field组成；
+\end{itemize}
+
+这是我们数据在数据库中的组织方式，但是为了将其持久化地存储在硬盘中，我们需要使用序列化和反序列化地方法，将其转化为字节流。下面的章节介绍了我们如何进行序列化和反序列化。
+
+\subsection{Record Persistence}
+
+\subsubsection{Column}
+
+Column 的结构是|COLUMN\_MAGIC\_NUM 4 | name\_ length 4 | name.strlen() | | type\_ 4 | len\_ 4 | table\_ind\_ 4 | nullable\_ 1 | unique\_ 1 |
+
+\paragraph{Serialize}
+逐个写入每个字段，然后将其转化为字节流。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+uint32_t Column::SerializeTo(char *buf) const {
+  uint32_t offset = 0;
+  memcpy(buf + offset, &COLUMN_MAGIC_NUM, sizeof(COLUMN_MAGIC_NUM));
+  offset += sizeof(COLUMN_MAGIC_NUM);
+  uint32_t name_len = name_.length();
+  memcpy(buf + offset, &name_len, sizeof(name_len));
+  offset += sizeof(name_len);
+  memcpy(buf + offset, name_.c_str(), name_len);
+  offset += name_len;
+  memcpy(buf + offset, &type_, sizeof(type_));
+  offset += sizeof(type_);
+  memcpy(buf + offset, &len_, sizeof(len_));
+  offset += sizeof(len_);
+  memcpy(buf + offset, &table_ind_, sizeof(table_ind_));
+  offset += sizeof(table_ind_);
+  memcpy(buf + offset, &nullable_, sizeof(nullable_));
+  offset += sizeof(nullable_);
+  memcpy(buf + offset, &unique_, sizeof(unique_));
+  offset += sizeof(unique_);
+  return offset;
+}
+\end{minted}
+
+\paragraph{Deserialize}
+逐个读取每个字段，然后将其转化为Column。
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+uint32_t Column::DeserializeFrom(char *buf, Column *&column) {
+  if (column != nullptr) {
+    LOG(WARNING) << "Pointer to column is not null in column deserialize." << std::endl;
+  }
+  uint32_t offset = 0;
+  uint32_t magic_num;
+  memcpy(&magic_num, buf + offset, sizeof(magic_num));
+  offset += sizeof(magic_num);
+  ASSERT(magic_num == COLUMN_MAGIC_NUM, "Invalid magic number.");
+  if (magic_num != COLUMN_MAGIC_NUM) {
+    return 0;
+  } 
+  uint32_t name_len;
+  memcpy(&name_len, buf + offset, sizeof(name_len));
+  offset += sizeof(name_len);
+  std::string name(buf + offset, name_len);
+  offset += name_len;
+  TypeId type;
+  memcpy(&type, buf + offset, sizeof(type));
+  offset += sizeof(type);
+  uint32_t len;
+  memcpy(&len, buf + offset, sizeof(len));
+  offset += sizeof(len);
+  uint32_t table_ind;
+  memcpy(&table_ind, buf + offset, sizeof(table_ind));
+  offset += sizeof(table_ind);
+  bool nullable;
+  memcpy(&nullable, buf + offset, sizeof(nullable));
+  offset += sizeof(nullable);
+  bool unique;
+  memcpy(&unique, buf + offset, sizeof(unique));
+  offset += sizeof(unique);
+  if (type == TypeId::kTypeChar) {
+    column = new Column(name, type, len, table_ind, nullable, unique);
+  } else {
+    column = new Column(name, type, table_ind, nullable, unique);
+  }
+  return offset;
+}
+\end{minted}
+
+\subsubsection{Schema}
+
+Schema 的结构是\verb|| SCHEMA\_MAGIC\_NUM 4 | column size 4 | column1 | column2 | ... ||
+
+\paragraph{Serialize}
+逐个写入每个字段，然后将其转化为字节流。
+
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+uint32_t Schema::SerializeTo(char *buf) const {
+  uint32_t offset = 0;
+  memcpy(buf + offset, &SCHEMA_MAGIC_NUM, sizeof(SCHEMA_MAGIC_NUM));
+  offset += sizeof(SCHEMA_MAGIC_NUM);
+  uint32_t column_size = columns_.size();
+  memcpy(buf + offset, &column_size, sizeof(column_size));
+  offset += sizeof(column_size);
+  for (auto column : columns_) {
+    offset += column->SerializeTo(buf + offset);
+  }
+  return offset;
+}
+\end{minted}
+
+\paragraph{Deserialize}
+
+逐个读取每个字段，然后将其转化为Schema。
+
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+uint32_t Schema::DeserializeFrom(char *buf, Schema *&schema) {
+  uint32_t offset = 0;
+  uint32_t magic_num;
+  memcpy(&magic_num, buf + offset, sizeof(magic_num));
+  offset += sizeof(magic_num);
+  ASSERT(magic_num == SCHEMA_MAGIC_NUM, "Invalid magic number.");
+  if (magic_num != SCHEMA_MAGIC_NUM) {
+    return 0;
+  }
+  uint32_t column_size;
+  memcpy(&column_size, buf + offset, sizeof(column_size));
+  offset += sizeof(column_size);
+  std::vector<Column *> columns;
+  for (uint32_t i = 0; i < column_size; i++) {
+    Column *temp = nullptr;
+    offset += Column::DeserializeFrom(buf + offset, temp);
+    columns.emplace_back(temp);
+  }
+  schema = new Schema(columns, true);
+  return offset;
+}
+\end{minted}
+
+\subsubsection{Row}
+
+对于Row类型对象的序列化，对于为null的Field，可以通过位图的方式标记(即 Null Bitmaps)；对于Row类型对象的反序列化，在反序列化每一个Field时，反序列化出来的Field的内存都由该Row对象维护。
+
+\paragraph{Serialize}
+
+写入长度num，写入位图页，然后写入每一个Field。
+
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+uint32_t Schema::SerializeTo(char *buf) const {
+  // | SCHEMA_MAGIC_NUM 4 | column size 4 | column1 | column2 | ... |
+  uint32_t offset = 0;
+  memcpy(buf + offset, &SCHEMA_MAGIC_NUM, sizeof(SCHEMA_MAGIC_NUM));
+  offset += sizeof(SCHEMA_MAGIC_NUM);
+  uint32_t column_size = columns_.size();
+  memcpy(buf + offset, &column_size, sizeof(column_size));
+  offset += sizeof(column_size);
+  for (auto column : columns_) {
+    offset += column->SerializeTo(buf + offset);
+  }
+  return offset;
+}
+\end{minted}
+
+\paragraph{Deserialize}
+
+读取长度num，读取位图页，然后读取每一个Field。
+
+\begin{minted}[
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines]{cpp}
+uint32_t Schema::DeserializeFrom(char *buf, Schema *&schema) {
+  uint32_t offset = 0;
+  uint32_t magic_num;
+  memcpy(&magic_num, buf + offset, sizeof(magic_num));
+  offset += sizeof(magic_num);
+  ASSERT(magic_num == SCHEMA_MAGIC_NUM, "Invalid magic number.");
+  if (magic_num != SCHEMA_MAGIC_NUM) {
+    return 0;
+  }
+  uint32_t column_size;
+  memcpy(&column_size, buf + offset, sizeof(column_size));
+  offset += sizeof(column_size);
+  std::vector<Column *> columns;
+  for (uint32_t i = 0; i < column_size; i++) {
+    Column *temp = nullptr;
+    offset += Column::DeserializeFrom(buf + offset, temp);
+    columns.emplace_back(temp);
+  }
+  schema = new Schema(columns, true);
+  return offset;
+}
+\end{minted}
+
+\subsection{table heap}
+
+对于数据表中的每一行记录，都有一个唯一标识符RowId与之对应。
+RowId同时具有逻辑和物理意义，在物理意义上，它是一个64位整数，是每行记录的唯一标识；
+RowId的作用主要体现在两个方面：一是在索引中，叶结点中存储的键值对是索引键Key到RowId的映射，通过索引键Key，沿着索引查找，我们能够得到该索引键对应记录的RowId，也就能够在堆表中定位到该记录；
+二是在堆表中，借助RowId中存储的逻辑信息（page\_id和slot\_num），可以快速地定位到其对应的记录位于物理文件的哪个位置。而在逻辑意义上，它的高32位存储的是该RowId对应记录所在数据页的page\_id，
+低32位存储的是该RowId在page\_id对应的数据页中对应的是第几条记录。我们可以通过RowId的逻辑信息，得到该Row的数据。
+
+我们需要一个table heap来存储数据表中的记录，table heap的结构如下：
+堆表中的每个数据页都由表头（Table Page Header）、空闲空间（Free Space）和已经插入的数据（Inserted Tuples）三部分组成，
+表头在页中从左往右扩展，记录了PrevPageId、NextPageId、FreeSpacePointer以及每条记录在TablePage中的偏移和长度；
+插入的记录在页中从右向左扩展，每次插入记录时会将FreeSpacePointer的位置向左移动。
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=.8\textwidth]{figures/table_heap.png}
+    \caption{Table Page}
+    \label{table_page}
+\end{figure}
+
+\subsubsection{table heap implementation}
+实现堆表的插入、删除、查询等操作，具体实现如下：
+\paragraph{InsertTuple}
+向堆表中插入一条记录，插入记录后生成的RowId需要通过row对象返回（即row.rid\_）；我们首先判断插入的记录是否能够放入当前页中，如果超出当前页的空间限制，我们需要将记录插入到下一个页中。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool TableHeap::InsertTuple(Row &row, Txn *txn) {
+  if(row.GetSerializedSize(schema_) >= PAGE_SIZE) return false;
+  auto page = reinterpret_cast<TablePage *>(buffer_pool_manager_->FetchPage(GetFirstPageId()));
+  if (page == nullptr) {
+    return false;
+  }
+  while(!page->InsertTuple(row, schema_, txn, lock_manager_, log_manager_)){
+    buffer_pool_manager_->UnpinPage(page->GetTablePageId(), false);
+    page_id_t next_page_id = page->GetNextPageId();
+    if(next_page_id == INVALID_PAGE_ID){
+      auto new_page = reinterpret_cast<TablePage *>(buffer_pool_manager_->NewPage(next_page_id));
+      page->SetNextPageId(next_page_id);
+      new_page->Init(next_page_id, page->GetTablePageId(), log_manager_, txn);
+      buffer_pool_manager_->UnpinPage(page->GetPageId(), true);
+      page = new_page;
+    }else{
+      auto next_page = reinterpret_cast<TablePage *>(buffer_pool_manager_->FetchPage(next_page_id));
+      buffer_pool_manager_->UnpinPage(page->GetPageId(), false);
+      page = next_page;
+    }
+  }
+  buffer_pool_manager_->UnpinPage(page->GetTablePageId(), true);
+  return true;
+}
+\end{minted}
+
+\paragraph{ApplyDelete}
+删除记录是采用先标记后统一执行输出的方式进行删除，这里实现的是执行删除的部分。
+
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void TableHeap::ApplyDelete(const RowId &rid, Txn *txn) {
+  // Step1: Find the page which contains the tuple.
+  auto page = reinterpret_cast<TablePage *>(buffer_pool_manager_->FetchPage(rid.GetPageId()));
+  ASSERT(page != nullptr, "The page could not be found.");
+  // Step2: Delete the tuple from the page.
+  page->ApplyDelete(rid, txn, log_manager_);
+  buffer_pool_manager_->UnpinPage(page->GetTablePageId(), true);
+}
+\end{minted}
+
+\paragraph{GetTuple}
+根据Row找到page，然后根据page读出数据
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool TableHeap::GetTuple(Row *row, Txn *txn) {
+  page_id_t page_id = row->GetRowId().GetPageId();
+  auto page = reinterpret_cast<TablePage *>(buffer_pool_manager_->FetchPage(page_id));
+  if (page == nullptr) {
+    return false;
+  }
+  bool result = page->GetTuple(row, schema_, txn, lock_manager_);
+  buffer_pool_manager_->UnpinPage(page_id, false);
+  return result;
+}
+\end{minted}
+
+\paragraph{UpdateTuple}
+这一部分要根据page的UpdateTuple的返回值来判读，我在原来page的函数基础上修改了返回值，如果slot\_num大于tuple\_count，说明slot\_num是无效的，返回1；如果tuple\_size是删除的，返回2；如果没有足够的空间更新，返回3；如果成功，返回0。
+修改后的函数如下：
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}  
+uint32_t TablePage::UpdateTuple(Row &new_row, Row *old_row, Schema *schema, Txn *txn, LockManager *lock_manager,
+LogManager *log_manager) {
+  ASSERT(old_row != nullptr && old_row->GetRowId().Get() != INVALID_ROWID.Get(), "invalid old row.");
+  uint32_t serialized_size = new_row.GetSerializedSize(schema);
+  ASSERT(serialized_size > 0, "Can not have empty row.");
+  uint32_t slot_num = old_row->GetRowId().GetSlotNum();
+  // If the slot number is invalid, abort.
+  if (slot_num >= GetTupleCount()) {
+    return 1;
+  }
+  uint32_t tuple_size = GetTupleSize(slot_num);
+  // If the tuple is deleted, abort.
+  if (IsDeleted(tuple_size)) {
+    return 2;
+  }
+  // If there is not enough space to update, we need to update via delete followed by an insert (not enough space).
+  if (GetFreeSpaceRemaining() + tuple_size < serialized_size) {
+    return 3;
+  }
+  ...
+  // if success
+  return 0;
+}
+\end{minted}
+在上面的三种失败情况后，如果是情况3，我们需要先删除再插入，下面是具体的实现：
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool TableHeap::UpdateTuple(Row &row, const RowId &rid, Txn *txn) {
+  // Find the page which contains the tuple.
+  auto page = reinterpret_cast<TablePage *>(buffer_pool_manager_->FetchPage(rid.GetPageId()));
+  if (page == nullptr) {
+    return false;
+  }
+  Row old_row(rid);
+  // Update the tuple in the page.
+  int update_res = page->UpdateTuple(row, &old_row, schema_, txn, lock_manager_, log_manager_);
+  if(update_res != 0){
+    if(update_res == 3){
+      if(InsertTuple(row, txn)){
+        MarkDelete(rid, txn);
+        buffer_pool_manager_->UnpinPage(page->GetTablePageId(), true);
+        return true;
+      }else{
+        buffer_pool_manager_->UnpinPage(page->GetTablePageId(), false);
+        return false;
+      }
+    }else{
+      buffer_pool_manager_->UnpinPage(page->GetTablePageId(), false);
+      return false;
+    }
+  }
+  else{
+    row.SetRowId(rid);
+    buffer_pool_manager_->UnpinPage(page->GetTablePageId(), true);
+    return true;
+  }
+}
+\end{minted}
+
+\subsubsection{table heap iterator implementation}
+实现迭代器，用于遍历table heap中的所有记录。在上层中提供begin和end函数，返回迭代器，然后通过迭代器的next函数来遍历所有记录。迭代器的成员变量是\verb|TableHeap *table_heap_;RowId rid_;|，其中table\_heap是指向table heap的指针，rid是当前记录的RowId。下面给出迭代器的实现：
+\paragraph{TableIterator ctor}
+构造函数，初始化迭代器的成员变量。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+TableIterator::TableIterator(TableHeap *table_heap, RowId rid, Txn *txn) {
+  table_heap_ = table_heap;
+  rid_ = rid;
+  txn_ = txn;
+}
+\end{minted}
+
+\paragraph{TableIterator copy ctor}
+拷贝构造函数，用于拷贝迭代器。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+TableIterator::TableIterator(const TableIterator &other) {
+  table_heap_ = other.table_heap_;
+  rid_ = other.rid_;
+  txn_ = other.txn_;
+}
+\end{minted}
+
+\paragraph{TableIterator dtor}
+析构函数，用于释放迭代器的资源。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+TableIterator::~TableIterator() {
+  table_heap_ = nullptr;
+  rid_ = RowId();
+  txn_ = nullptr;
+}
+\end{minted}    
+ 
+\paragraph{operator==}
+==运算符，用于判断两个迭代器是否相等。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool TableIterator::operator==(const TableIterator &itr) const {
+  return this->rid_ == itr.rid_;
+}
+\end{minted}
+
+\paragraph{operator!=}
+!=运算符，用于判断两个迭代器是否不相等。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool TableIterator::operator!=(const TableIterator &itr) const {
+  return !(*this == itr);
+}
+\end{minted}
+
+\paragraph{operator*}
+*运算符，用于获取迭代器指向的记录。根据RowwId找到page，然后根据page读出数据，返回Row。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+const Row &TableIterator::operator*() {
+  auto page = reinterpret_cast<TablePage *>(table_heap_->buffer_pool_manager_->FetchPage(rid_.GetPageId()));
+  if (page == nullptr) {
+    table_heap_->buffer_pool_manager_->UnpinPage(rid_.GetPageId(), false);
+    Row *row = new Row(INVALID_ROWID);
+    return *row;
+  }
+  Row *row = new Row(rid_);
+  bool res = page->GetTuple(row, table_heap_->schema_, txn_, table_heap_->lock_manager_);
+  if(res){
+    table_heap_->buffer_pool_manager_->UnpinPage(page->GetPageId(), false);
+    return *row;
+  }else{
+    table_heap_->buffer_pool_manager_->UnpinPage(page->GetPageId(), false);
+    Row *row = new Row(INVALID_ROWID);
+    return *row;
+  }
+}
+\end{minted}
+
+\paragraph{operator->}
+->运算符，用于获取迭代器指向的记录，返回Row的指针。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+Row *TableIterator::operator->() {
+  auto page = reinterpret_cast<TablePage *>(table_heap_->buffer_pool_manager_->FetchPage(rid_.GetPageId()));
+  if (page == nullptr) {
+    table_heap_->buffer_pool_manager_->UnpinPage(rid_.GetPageId(), false);
+    return nullptr;
+  }
+  Row *row = new Row(rid_);
+  bool res = page->GetTuple(row, table_heap_->schema_, txn_, table_heap_->lock_manager_);
+  if(res){
+    table_heap_->buffer_pool_manager_->UnpinPage(page->GetPageId(), false);
+    return row;
+  }else{
+    table_heap_->buffer_pool_manager_->UnpinPage(page->GetPageId(), false);
+    return nullptr;
+  }
+}
+\end{minted}
+
+\paragraph{operator=}
+=运算符，用于赋值和初始化。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+TableIterator &TableIterator::operator=(const TableIterator &itr) noexcept {
+  table_heap_ = itr.table_heap_;
+  rid_ = itr.rid_;
+  txn_ = itr.txn_;
+  return *this;
+}
+\end{minted}
+
+\paragraph{operator++//++iter}
+++运算符，用于迭代器自增，从tableheap中找到下一个记录，需要注意的是可能存在下一条记录在下一页的情况。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+TableIterator &TableIterator::operator++() {
+  auto page = reinterpret_cast<TablePage *>(table_heap_->buffer_pool_manager_->FetchPage(rid_.GetPageId()));
+  if (page == nullptr) {
+    table_heap_->buffer_pool_manager_->UnpinPage(rid_.GetPageId(), false);
+    this->table_heap_ = nullptr;
+    this->rid_ = RowId();
+    this->txn_ = nullptr;
+    return *this;
+  }
+  bool res = page->GetNextTupleRid(rid_, &rid_);
+  if(res){
+    // 不用翻下一页
+    table_heap_->buffer_pool_manager_->UnpinPage(page->GetPageId(), false);
+    return *this;
+  }else{
+    // 翻下一页
+    page_id_t next_page_id = page->GetNextPageId();
+    if(next_page_id == INVALID_PAGE_ID){
+      this->table_heap_ = nullptr;
+      this->rid_ = RowId();
+      this->txn_ = nullptr;
+      return *this;
+    }else{
+      auto next_page = reinterpret_cast<TablePage *>(table_heap_->buffer_pool_manager_->FetchPage(next_page_id));
+      table_heap_->buffer_pool_manager_->UnpinPage(page->GetPageId(), false);
+      page = next_page;
+      page->GetFirstTupleRid(&rid_);
+    }
+  }
+  table_heap_->buffer_pool_manager_->UnpinPage(page->GetPageId(), false);
+  return *this;  
+}
+\end{minted}
+
+\paragraph{operator++(int)//iter++}
+++运算符，用于迭代器自增，从tableheap中找到下一个记录，需要注意的是可能存在下一条记录在下一页的情况。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+TableIterator TableIterator::operator++(int) {
+  TableIterator p(*this);
+  ++(*this);
+  return TableIterator{p};
+}
+\end{minted}
+
+\subsubsection{table heap iterator}
+这是迭代器给上层的接口，包括begin和end函数，用于返回迭代器。
+
+\paragraph{begin}
+返回一个指向第一条记录的迭代器，使用page实现的GetFirstTuple函数。如果没找到，返回一个空迭代器。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+TableIterator TableHeap::Begin(Txn *txn) {
+  auto page = reinterpret_cast<TablePage *>(buffer_pool_manager_->FetchPage(GetFirstPageId()));
+  if (page == nullptr) {
+    buffer_pool_manager_->UnpinPage(page->GetTablePageId(), false);
+    return TableIterator(this, RowId(), nullptr);
+  }
+  RowId rid;
+  if(page->GetFirstTupleRid(&rid)){
+    buffer_pool_manager_->UnpinPage(page->GetTablePageId(), false);
+    return TableIterator(this, rid, txn);
+  }else{
+    buffer_pool_manager_->UnpinPage(page->GetTablePageId(), false);
+    return TableIterator(this, RowId(), nullptr);
+  }
+}
+\end{minted}
+
+\paragraph{end}
+返回end迭代器，应当是最后一个的下一个，即返回一个空迭代器。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+TableIterator TableHeap::End() { return TableIterator(nullptr, RowId(), nullptr); }
+\end{minted}
+
+\subsection{test}
+这部分框架提供的测试用例太少了，只对insert tuple和get tuple进行了测试，为了全面地测试我们实现的table heap和table heap iterator，我们自己编写了测试用例，测试了iterator，update tuple and free测试用例如下：
+\tbox{
+  这部分代码是自己添加的测试代码，完善了框架的测试，希望能够加入到下一年的测试框架中。
+}
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+    static string db_file_name = "table_heap_test.db";
+using Fields = std::vector<Field>;
+
+TEST(TableHeapTest, TableHeapSampleTest) {
+  // init testing instance
+  vector<RowId> row_ids;
+  remove(db_file_name.c_str());
+  auto disk_mgr_ = new DiskManager(db_file_name);
+  auto bpm_ = new BufferPoolManager(DEFAULT_BUFFER_POOL_SIZE, disk_mgr_);
+  const int row_nums = 10000;
+  // create schema
+  std::vector<Column *> columns = {new Column("id", TypeId::kTypeInt, 0, false, false),
+                                   new Column("name", TypeId::kTypeChar, 64, 1, true, false),
+                                   new Column("account", TypeId::kTypeFloat, 2, true, false)};
+  auto schema = std::make_shared<Schema>(columns);
+  // create rows
+  std::unordered_map<int64_t, Fields *> row_values;
+  uint32_t size = 0;
+  TableHeap *table_heap = TableHeap::Create(bpm_, schema.get(), nullptr, nullptr, nullptr);
+  for (int i = 0; i < row_nums; i++) {
+    int32_t len = RandomUtils::RandomInt(0, 64);
+    char *characters = new char[len];
+    RandomUtils::RandomString(characters, len);
+    Fields *fields =
+        new Fields{Field(TypeId::kTypeInt, i), Field(TypeId::kTypeChar, const_cast<char *>(characters), len, true),
+                   Field(TypeId::kTypeFloat, RandomUtils::RandomFloat(-999.f, 999.f))};
+    Row row(*fields);
+    ASSERT_TRUE(table_heap->InsertTuple(row, nullptr));
+    if (row_values.find(row.GetRowId().Get()) != row_values.end()) {
+      std::cout << row.GetRowId().Get() << std::endl;
+      ASSERT_TRUE(false);
+    } else {
+      row_values.emplace(row.GetRowId().Get(), fields);
+      row_ids.push_back(row.GetRowId());
+      size++;
+    }
+    delete[] characters;
+  }
+  ASSERT_EQ(row_nums, row_values.size());
+  ASSERT_EQ(row_nums, size);
+  for (auto row_kv : row_values) {
+    size--;
+    Row row(RowId(row_kv.first));
+    table_heap->GetTuple(&row, nullptr);
+    ASSERT_EQ(schema.get()->GetColumnCount(), row.GetFields().size());
+    for (size_t j = 0; j < schema.get()->GetColumnCount(); j++) {
+      ASSERT_EQ(CmpBool::kTrue, row.GetField(j)->CompareEquals(row_kv.second->at(j)));
+    }
+    // free spaces
+    delete row_kv.second;
+  }
+  // test iterator
+  ASSERT_EQ(size, 0);
+  int count = 0;
+  for(auto iter = table_heap->Begin(nullptr); iter != table_heap->End(); ++iter){
+    Row row(iter->GetRowId());
+    table_heap->GetTuple(&row, nullptr);
+    ASSERT_EQ(schema.get()->GetColumnCount(), row.GetFields().size());
+    ASSERT_EQ(schema.get()->GetColumnCount(), iter->GetFields().size());
+    for(size_t j = 0; j < schema.get()->GetColumnCount(); j++){
+      ASSERT_EQ(CmpBool::kTrue, row.GetField(j)->CompareEquals(*iter->GetField(j)));
+    }
+    count++;
+  }
+  ASSERT_EQ(count, row_nums);
+  
+  // test update
+  std::unordered_map<int64_t, Fields *> new_row_values;
+  std::set<page_id_t> used_pages;
+  for(int i = 0; i < row_nums; i++){
+    int32_t len = RandomUtils::RandomInt(0, 64);
+    char *characters = new char[len];
+    RandomUtils::RandomString(characters, len);
+    Fields *fields = new Fields{Field(TypeId::kTypeInt, i), Field(TypeId::kTypeChar, const_cast<char *>(characters), len, true),
+                                Field(TypeId::kTypeFloat, RandomUtils::RandomFloat(-999.f, 999.f))};
+    Row row(*fields);
+    ASSERT_EQ(true, table_heap->UpdateTuple(row, row_ids.at(i), nullptr));
+    ASSERT_EQ(false, row.GetRowId().GetPageId()== INVALID_PAGE_ID);
+    new_row_values[row.GetRowId().Get()] = fields;
+    delete[] characters;
+  }
+  // check the update result
+  for(auto row_kv2 : new_row_values){
+    Row row(RowId(row_kv2.first));
+    ASSERT_EQ(true, table_heap->GetTuple(&row, nullptr));
+    used_pages.insert(row.GetRowId().GetPageId());
+    ASSERT_EQ(schema.get()->GetColumnCount(), row.GetFields().size());
+    for(size_t j = 0; j < schema.get()->GetColumnCount(); j++){
+      ASSERT_EQ(CmpBool::kTrue, row.GetField(j)->CompareEquals(row_kv2.second->at(j)));
+    }
+    table_heap->ApplyDelete(row.GetRowId(), nullptr);
+    ASSERT_EQ(false, table_heap->GetTuple(&row, nullptr));
+    delete row_kv2.second;
+  }
+  // test free
+  table_heap->FreeTableHeap();
+  auto *disk = new DiskManager(db_file_name);
+  auto *bpm = new BufferPoolManager(100, disk);
+  ASSERT_EQ(true, bpm->IsPageFree(*used_pages.begin()));
+  for(auto page_id : used_pages){
+    ASSERT_EQ(true, bpm->IsPageFree(page_id));
+  }
+  delete disk;
+  delete bpm;
+  delete disk_mgr_;
+  delete bpm_;
+}
+\end{minted}
+
+本节的test全部通过。
+
+\begin{figure}[!htbp]
+  \centering
+  \begin{subfigure}
+    \centering
+    \includegraphics[width=.8\textwidth]{figures/test5.png}
+    \caption{Tuple Test}
+    \label{tuple_test}
+  \end{subfigure}
+  \begin{subfigure}
+    \centering
+    \includegraphics[width=.8\textwidth]{figures/test6.png}
+    \caption{Table Heap Test}
+    \label{table_heap_test}
+  \end{subfigure}
+\end{figure}
+
+\section{INDEX MANAGER}
+\subsection{summary}
+Index Manager 负责数据表索引的实现和管理，包括：索引的创建和删除，索引键的等值查找，索引键的范围查找（返回对应的迭代器），以及插入和删除键值等操作，并对外提供相应的接口。
+为了提高搜索的效率，我们实现基于磁盘的B+树动态索引结构。首先完成b+树数据结构的实现，然后建立在此基础上建立索引。
+
+\subsection{BPlusTree}
+首先我们要实现B+树的数据结构，在这里是基于磁盘的数据页实现的，因此我们需要实现BPlusTreeInternal和BPlusTreeLeaf，为BPlusTree的实现提供接口。
+\subsubsection{BPlusTreePage}
+我们知道，b+树存在两种节点，一种是内部节点，一种是叶子节点。内部节点存储的是索引键和指向子节点的指针，叶子节点存储的是索引键和指向记录的指针。这二者具有部分相同的成员变量，
+因此设计上可以通过一个共同父类继承得到两个子类，这里的\verb|BPlusTreepage|是\verb|BPlusTreeInternalPage|和\verb|BPlusTreeLeafPage|的父类。包含了中间结点和叶子结点的共同成员变量。
+\begin{itemize}
+  \item \textbf{page\_type\_}: 用于标识当前页是叶子页还是中间页。
+  \item \textbf{key\_size\_}: 索引键的大小。
+  \item \textbf{lsn\_}: 数据页的日志序列号，该模块中不会用到；
+  \item \textbf{size\_}: 当前结点中存储Key-Value键值对的数量；
+  \item \textbf{max\_size\_}: 当前结点中最多可以存储的Key-Value键值对的数量；
+  \item \textbf{parent\_page\_id\_}: 父结点对应数据页的page\_id;
+  \item \textbf{page\_id\_}: 当前数据页的page\_id;
+\end{itemize}
+这个类的实现较为简单，主要是一些getter和setter函数，需要注意的点就是最小size应当是最大size的一半，这部分实现较为简单，这里就不再赘述。
+
+\subsubsection{BPlusTreeInternalPage}
+内部节点的实现，继承自BPlusTreePage，内部节点存储的是索引键和指向子节点的指针，因此需要实现插入、删除、查找等操作，除此以外，BPlusTree还会做merge和split操作，需要一些将子节点的key和value移动到另一个节点的操作。以下是各个接口的具体实现：
+
+\paragraph{Init}
+初始化page\_id, parent\_page\_id, page\_type, key\_size, max\_size, size, lsn等成员变量。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::Init(page_id_t page_id, page_id_t parent_id, int key_size, int max_size) {
+  SetPageType(IndexPageType::INTERNAL_PAGE);
+  SetSize(0);
+  SetPageId(page_id);
+  SetParentPageId(parent_id);
+  SetKeySize(key_size);
+  SetMaxSize(max_size);
+  SetLSN(INVALID_LSN);
+}
+\end{minted}
+
+\subsubsection*{Search}
+\paragraph{Lookup}
+这里要使用二分查找来提高搜索的速度，这里调用了KeyManager的CompareKeys函数来比较两个key的大小，我们应当是无感知地获得比较的结果。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+page_id_t InternalPage::Lookup(const GenericKey *key, const KeyManager &KM) {
+  int left = 1, right = GetSize() - 1;
+  while (left <= right)
+  {
+    int mid = (left + right) / 2;
+    if (KM.CompareKeys(KeyAt(mid), key) <= 0)
+      left = mid + 1;
+    else
+      right = mid - 1;
+  }
+  return ValueAt(right);
+}
+\end{minted}
+
+\subsubsection*{Insert} 
+实现插入操作需要使用的几个函数。
+\paragraph{PopulateNewRoot}
+给建立的新的根节点进行初始化，将两个子节点的page\_id和key\_id插入到新的根节点中。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::PopulateNewRoot(const page_id_t &old_value, GenericKey *new_key, const page_id_t &new_value) {
+  SetSize(2);
+  SetValueAt(0, old_value);
+  SetKeyAt(1, new_key);
+  SetValueAt(1, new_value);
+}
+\end{minted}
+
+\paragraph{InsertNodeAfter}
+在给定的位置后插入一个新的key和value，这里需要将原来的key和value向后移动一个位置，然后插入新的key和value，返回当前的size。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+int InternalPage::InsertNodeAfter(const page_id_t &old_value, GenericKey *new_key, const page_id_t &new_value) {
+  int index = ValueIndex(old_value);
+  if (index == -1)
+    return -1;
+  int size = GetSize();
+  for (int i = size; i > index + 1; --i)
+  {
+    PairCopy(pairs_off + i * pair_size, pairs_off + (i - 1) * pair_size);
+  }
+  SetKeyAt(index + 1, new_key);
+  SetValueAt(index + 1, new_value);
+  IncreaseSize(1);
+  return size + 1;
+}
+\end{minted}
+
+\subsubsection*{split}
+\paragraph{MoveHalfTo}
+将当前节点的一半key和value移动到另一个节点，这个函数调用了CopyNfrom这个复制函数，将当前节点的一半key和value复制到另一个节点中，然后将当前节点的一半key和value删除。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::MoveHalfTo(InternalPage *recipient, BufferPoolManager *buffer_pool_manager) {
+  int size = GetSize();
+  int left_size = size / 2, right_size = size - left_size;
+  recipient->CopyNFrom(pairs_off + left_size * pair_size, right_size, buffer_pool_manager);
+  IncreaseSize(-right_size);
+}
+\end{minted}
+
+\paragraph{CopyNFrom}
+向自身拷贝另一个节点的一部分key和value，这里调用了PairCopy函数，将另一个节点的key和value复制到自身中。此时是中间结点还要对儿子节点的parent进行更新。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::CopyNFrom(void *src, int size, BufferPoolManager *buffer_pool_manager) {
+  // copy entries
+  int old_size = GetSize();
+  PairCopy(pairs_off + old_size * pair_size, src, size);
+  IncreaseSize(size);
+  // update parent page id and get persisted
+  for(int i = old_size; i < size; ++i)
+  {
+    page_id_t page_id = ValueAt(i);
+    auto *page = buffer_pool_manager->FetchPage(page_id);
+    ASSERT(page != nullptr, "page is nullptr");
+    auto *internal_page = reinterpret_cast<BPlusTreePage *>(page->GetData());
+    internal_page->SetParentPageId(GetPageId());
+    buffer_pool_manager->UnpinPage(page_id, true);
+  }
+}
+\end{minted}
+
+\subsubsection*{Remove}
+\paragraph{Remove}
+在中间结点中删除特定的key和value。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::Remove(int index) {
+  int size = GetSize();
+  for (int i = index; i < size - 1; ++i)
+  {
+    PairCopy(pairs_off + i * pair_size, pairs_off + (i + 1) * pair_size);
+  }
+  IncreaseSize(-1);
+}
+\end{minted}
+
+\paragraph{RemoveAndReturnOnlyChild}
+删除当前节点的key和value，返回当前节点的唯一的子节点的page\_id。这个函数只会在AdjustRoot()中调用。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+page_id_t InternalPage::RemoveAndReturnOnlyChild() {
+  page_id_t value = ValueAt(0);
+  IncreaseSize(-1);
+  return value;
+}
+\end{minted}
+
+\subsubsection*{merge}
+\paragraph{MoveAllTo}
+将自身的全部结点移动到另一个接收结点中，需要更新子节点的parent\_page\_id。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::MoveAllTo(InternalPage *recipient, GenericKey *middle_key, BufferPoolManager *buffer_pool_manager) {
+  int size = GetSize(), recipient_size = recipient->GetSize();
+  recipient->CopyNFrom(pairs_off, size, buffer_pool_manager);
+  recipient->SetKeyAt(recipient_size, middle_key);
+  // update parent page id and get persisted
+  for(int i = 0; i < size; ++i)
+  {
+    page_id_t page_id = ValueAt(i);
+    auto *page = buffer_pool_manager->FetchPage(page_id);
+    ASSERT(page != nullptr, "page is nullptr");
+    auto *internal_page = reinterpret_cast<BPlusTreePage *>(page->GetData());
+    internal_page->SetParentPageId(recipient->GetPageId());
+    buffer_pool_manager->UnpinPage(page_id, true);
+  }
+  SetSize(0);
+}
+\end{minted}
+
+\subsubsection*{Redistribute}
+\paragraph{MoveFirstToEndOf}
+将另一个节点的第一个key和value移动到自身的最后一个位置。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::MoveFirstToEndOf(InternalPage *recipient, GenericKey *middle_key, BufferPoolManager *buffer_pool_manager) {
+  recipient->CopyLastFrom(middle_key, ValueAt(0),buffer_pool_manager);
+  Remove(0);
+}
+\end{minted}
+
+\paragraph{CopyLastFrom}
+将另一个节点的最后一个key和value复制到自身的最后一个位置。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::CopyLastFrom(GenericKey *key, const page_id_t value, BufferPoolManager *buffer_pool_manager) {
+  int size = GetSize();
+  SetKeyAt(size, key);
+  SetValueAt(size, value);
+  IncreaseSize(1);
+  auto *page = buffer_pool_manager->FetchPage(value);
+  ASSERT(page != nullptr, "page is nullptr");
+  auto *internal_page = reinterpret_cast<BPlusTreePage *>(page->GetData());
+  internal_page->SetParentPageId(GetPageId());
+  buffer_pool_manager->UnpinPage(value, true);
+}
+\end{minted}
+
+\paragraph{MoveLastToFrontOf}
+将另一个节点的最后一个key和value移动到自身的第一个位置。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::MoveLastToFrontOf(InternalPage *recipient, GenericKey *middle_key,BufferPoolManager *buffer_pool_manager) {
+  recipient->CopyFirstFrom(ValueAt(GetSize() - 1), buffer_pool_manager);
+  recipient->SetKeyAt(0, KeyAt(GetSize() - 1));
+  recipient->SetKeyAt(1, middle_key);
+  Remove(GetSize() - 1);
+}
+\end{minted}
+
+\paragraph{CopyFirstFrom}
+将另一个节点的第一个key和value复制到自身的第一个位置，修改儿子节点的parent\_page\_id。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void InternalPage::CopyFirstFrom(const page_id_t value, BufferPoolManager *buffer_pool_manager) {
+  int size = GetSize();
+  for(int i = size;i > 0;i--){
+    PairCopy(pairs_off + i * pair_size, pairs_off + (i - 1) * pair_size);
+  }
+  SetValueAt(0, value);
+  IncreaseSize(1);
+  auto *page = buffer_pool_manager->FetchPage(value);
+  ASSERT(page != nullptr, "page is nullptr");
+  auto *internal_page = reinterpret_cast<BPlusTreePage *>(page->GetData());
+  internal_page->SetParentPageId(GetPageId());
+  buffer_pool_manager->UnpinPage(value, true);
+}
+\end{minted}
+
+\subsubsection{BPlusTreeLeafPage}
+叶子节点的实现，继承自BPlusTreePage，叶子节点存储的是索引键和指向记录的指针，大体的实现与内部节点类似，只是叶子节点不需要存储子节点的page\_id，而需要存储next\_page\_id，用于在范围查找时返回下一个叶子节点的page\_id。以下是各个接口的具体实现：
+
+\paragraph{Init}
+初始化page\_id, parent\_page\_id, page\_type, key\_size, max\_size, size, lsn等成员变量。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void LeafPage::Init(page_id_t page_id, page_id_t parent_id, int key_size, int max_size) {
+  SetPageType(IndexPageType::LEAF_PAGE);
+  SetKeySize(key_size);
+  SetLSN(INVALID_LSN);
+  SetSize(0);
+  SetPageId(page_id);
+  SetParentPageId(parent_id);
+  SetMaxSize(max_size);
+  SetNextPageId(INVALID_PAGE_ID);
+}
+\end{minted}
+
+\subsubsection*{Search}
+\paragraph{KeyIndex}
+在叶子节点中查找特定的key，返回对应的value。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+int LeafPage::KeyIndex(const GenericKey *key, const KeyManager &KM) {
+  int left = 0, right = GetSize() - 1;
+  while (left <= right)
+  {
+    int mid = (left + right) / 2;
+    if (KM.CompareKeys(KeyAt(mid), key) >= 0)
+      right = mid - 1;
+    else
+      left = mid + 1;
+  }
+  return left;
+}
+\end{minted}
+
+\paragraph{Lookup}
+对给定的key，查找是否存在。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool LeafPage::Lookup(const GenericKey *key, RowId &value, const KeyManager &KM) {
+  int index = KeyIndex(key, KM);
+  if (index < GetSize() && KM.CompareKeys(KeyAt(index), key) == 0)
+  {
+    value = ValueAt(index);
+    return true;
+  }
+  return false;
+}
+\end{minted}
+
+\paragraph{Insert}
+在叶子节点中插入特定的key和value
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+int LeafPage::Insert(GenericKey *key, const RowId &value, const KeyManager &KM) {
+  int index = KeyIndex(key, KM);
+  if (index < GetSize() && KM.CompareKeys(KeyAt(index), key) == 0) {
+    return GetSize();
+  }
+  int size = GetSize();
+  for (int i = size; i > index; i--)
+  {
+    PairCopy(pairs_off + i * pair_size, pairs_off + (i - 1) * pair_size);
+  }
+  SetKeyAt(index, key);
+  SetValueAt(index, value);
+  SetSize(size + 1);
+  return size + 1;
+}
+\end{minted}
+
+\subsubsection*{split}
+\paragraph{MoveHalfTo}
+将当前节点的一半key和value移动到另一个节点，这个函数调用了CopyNfrom这个复制函数，将当前节点的一半key和value复制到另一个节点中，然后将当前节点的一半key和value删除。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void LeafPage::MoveHalfTo(LeafPage *recipient) {
+  int size = GetSize();
+  int half = size / 2;
+  recipient->CopyNFrom(pairs_off + half * pair_size, size - half);
+  IncreaseSize(-size + half);
+}
+\end{minted}
+
+\paragraph{CopyNFrom}
+向自身拷贝另一个节点的一部分key和value，这里调用了PairCopy函数，将另一个节点的key和value复制到自身中。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void LeafPage::CopyNFrom(void *src, int size) {
+  PairCopy(pairs_off + GetSize() * pair_size, src, size);
+  IncreaseSize(size);
+}
+\end{minted}
+
+\subsubsection*{Remove}
+\paragraph{RemoveAndDeleteRecord}
+在叶子节点中删除特定的key和value。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+int LeafPage::RemoveAndDeleteRecord(const GenericKey *key, const KeyManager &KM) {
+  int index = KeyIndex(key, KM);
+  if (index < GetSize() && KM.CompareKeys(KeyAt(index), key) == 0)
+  {
+    int size = GetSize();
+    for (int i = index; i < size - 1; i++)
+    {
+      PairCopy(pairs_off + i * pair_size, pairs_off + (i + 1) * pair_size);
+    }
+    IncreaseSize(-1);
+  }
+  return GetSize();
+}
+\end{minted}
+
+\subsubsection*{merge}
+\paragraph{MoveAllTo}
+将自身的全部结点移动到另一个接收结点中，需要更新next\_page\_id。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void LeafPage::MoveAllTo(LeafPage *recipient) {
+  recipient->CopyNFrom(pairs_off, GetSize());
+  recipient->SetNextPageId(GetNextPageId());
+  SetSize(0);
+}
+\end{minted}
+
+\subsubsection*{Redistribute}
+\paragraph{MoveFirstToEndOf}
+将另一个节点的第一个key和value移动到自身的最后一个位置。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void LeafPage::MoveFirstToEndOf(LeafPage *recipient) {
+  int size = GetSize();
+  recipient->CopyLastFrom(KeyAt(0), ValueAt(0));
+  for (int i = 0; i < size - 1; i++)
+  {
+    PairCopy(pairs_off + i * pair_size, pairs_off + (i + 1) * pair_size);
+  }
+  IncreaseSize(-1);
+}
+\end{minted}
+
+\paragraph{CopyLastFrom}
+将另一个节点的最后一个key和value复制到自身的最后一个位置。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void LeafPage::CopyLastFrom(GenericKey *key, const RowId value) {
+  int size = GetSize();
+  SetKeyAt(size, key);
+  SetValueAt(size, value);
+  IncreaseSize(1);
+}
+\end{minted}
+
+\paragraph{MoveLastToFrontOf}
+将另一个节点的最后一个key和value移动到自身的第一个位置。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void LeafPage::MoveLastToFrontOf(LeafPage *recipient) {
+  int size = GetSize();
+  recipient->CopyFirstFrom(KeyAt(size - 1), ValueAt(size - 1));
+  IncreaseSize(-1);
+}
+\end{minted}
+
+\paragraph{CopyFirstFrom}
+将另一个节点的第一个key和value复制到自身的第一个位置。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void LeafPage::CopyFirstFrom(GenericKey *key, const RowId value) {
+  int size = GetSize();
+  for (int i = size; i > 0; i--)
+  {
+    PairCopy(pairs_off + i * pair_size, pairs_off + (i - 1) * pair_size);
+  }
+  SetKeyAt(0, key);
+  SetValueAt(0, value);
+  IncreaseSize(1);
+}
+\end{minted}
+
+\subsubsection{BPlusTree implementation}
+在前面的部分，我们已经完成了叶子结点和中间结点的实现，接下来我们要实现BPlusTree的接口，完成B+树的创建、插入、删除、查找和释放等操作。这里BPlusTree的成员变量包括：
+\begin{itemize}
+  \item index\_id\_t index\_id\_;
+  \item page\_id\_t root\_page\_id\_{INVALID\_PAGE\_ID};
+  \item BufferPoolManager *buffer\_pool\_manager\_;
+  \item KeyManager processor\_;
+  \item int leaf\_max\_size\_; 即((PAGE\_SIZE - LEAF\_PAGE\_HEADER\_SIZE) / (processor\_.GetKeySize() + sizeof(RowId)) - 1)
+  \item int internal\_max\_size\_;即((PAGE\_SIZE - INTERNAL\_PAGE\_HEADER\_SIZE) / (processor\_.GetKeySize() + sizeof(page\_id\_t)) - 1)
+\end{itemize}
+
+\paragraph{Init}
+首先创建一个BPlusTree的实例，初始化一些成员变量，包括key\_size, internal\_page\_size, leaf\_page\_size, root\_page\_id, buffer\_pool\_manager等。除此以外，我们还需要
+修改元数据页即IndexRootsPage，将root\_page\_id写入到元数据页中，调用了\verb|UpdateRootPageId|函数。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+BPlusTree::BPlusTree(index_id_t index_id, BufferPoolManager *buffer_pool_manager, const KeyManager &KM,
+                     int leaf_max_size, int internal_max_size)
+    : index_id_(index_id),
+      buffer_pool_manager_(buffer_pool_manager),
+      processor_(KM),
+      leaf_max_size_(leaf_max_size),
+      internal_max_size_(internal_max_size) {
+    root_page_id_ = INVALID_PAGE_ID;
+    Page *page = buffer_pool_manager_->FetchPage(INDEX_ROOTS_PAGE_ID);
+    IndexRootsPage *index_roots_page = reinterpret_cast<IndexRootsPage *>(page->GetData());
+    if (!index_roots_page->GetRootId(index_id, &root_page_id_)) {
+      root_page_id_ = INVALID_PAGE_ID;
+      UpdateRootPageId(1);
+    }
+    buffer_pool_manager_->UnpinPage(INDEX_ROOTS_PAGE_ID, false);
+    leaf_max_size_ = LEAF_PAGE_SIZE;
+    internal_max_size_ = INTERNAL_PAGE_SIZE;
+}
+\end{minted}
+
+\paragraph{UpdateRootPageId}
+修改index\_roots\_page中的当前index的root\_page\_id，用于索引查找b+树的根节点。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void BPlusTree::UpdateRootPageId(int insert_record) {
+  auto* page = buffer_pool_manager_->FetchPage(INDEX_ROOTS_PAGE_ID);
+  auto* index_roots_page = reinterpret_cast<IndexRootsPage*>(page->GetData());
+  if (insert_record) {
+    index_roots_page->Insert(index_id_, root_page_id_);
+  } else {
+    index_roots_page->Update(index_id_, root_page_id_);
+  }
+  buffer_pool_manager_->UnpinPage(INDEX_ROOTS_PAGE_ID, true);
+}
+\end{minted}
+
+\paragraph{destroy}
+\tbox{
+  我认为这里的destroy设计默认值为INVALID\_PAGE\_ID时实际上要求是删除全树这件事情十分不合理，这样的表意不明确，在文档里面也没有提及，造成了许多的困扰。
+}
+销毁以传入的结点为根结点的b+树，这里的销毁是递归的，首先销毁子节点，然后销毁自身，最后释放自身的page。如果是默认情况就删除全树，还要更新元数据页中的root\_page\_id。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void BPlusTree::Destroy(page_id_t current_page_id) {
+ if(current_page_id == INVALID_PAGE_ID) {
+    current_page_id = root_page_id_;
+  }
+    Page* page = buffer_pool_manager_->FetchPage(current_page_id);
+    BPlusTreePage* node = reinterpret_cast<BPlusTreePage*>(page->GetData());
+    if(node->IsLeafPage()) {
+      buffer_pool_manager_->DeletePage(current_page_id);
+      buffer_pool_manager_->UnpinPage(current_page_id, true);
+    }else{
+      InternalPage* internal = reinterpret_cast<InternalPage*>(node);
+      for(int i = 0; i < internal->GetSize(); i++) {
+        Destroy(internal->ValueAt(i));
+      }
+      buffer_pool_manager_->DeletePage(current_page_id);
+      buffer_pool_manager_->UnpinPage(current_page_id, true);
+  }
+  if(current_page_id == root_page_id_) {
+    auto head = buffer_pool_manager_->FetchPage(INDEX_ROOTS_PAGE_ID);
+    IndexRootsPage* index_roots_page = reinterpret_cast<IndexRootsPage*>(head->GetData());
+    index_roots_page->Delete(index_id_);
+    buffer_pool_manager_->UnpinPage(INDEX_ROOTS_PAGE_ID, true);
+  }
+}
+\end{minted}
+
+\paragraph{IsEmpty}
+判断b+树是否为空，如果根结点page\_id为INVALID\_PAGE\_ID，那么b+树为空。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool BPlusTree::IsEmpty() const {
+  return root_page_id_ == INVALID_PAGE_ID;
+}
+\end{minted}
+
+\paragraph{FindLeafPage}
+这是一个重要的函数，用于查找特定的key所在的叶子结点，在后面的插入、删除、查询中都会用到。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+Page *BPlusTree::FindLeafPage(const GenericKey *key, page_id_t page_id, bool leftMost) {
+  if(page_id == INVALID_PAGE_ID){
+    return FindLeafPage(key, root_page_id_, leftMost);
+  }
+  Page *page = buffer_pool_manager_->FetchPage(page_id);
+  auto *node = reinterpret_cast<BPlusTreePage *>(page->GetData());
+  if(node->IsLeafPage()) {
+    return page;
+  }else{
+    auto *internal_node = reinterpret_cast<InternalPage *>(node);
+    page_id_t child_page_id = leftMost ? internal_node->ValueAt(0) : internal_node->Lookup(key, processor_);
+    buffer_pool_manager_->UnpinPage(page_id, false);
+    return FindLeafPage(key, child_page_id, leftMost);
+  }
+  return nullptr;
+}
+\end{minted}
+
+\paragraph{Search}
+查找特定的key，返回对应的value，这里调用了FindLeafPage函数，找到对应的叶子结点，然后调用叶子结点的Lookup函数，返回对应的value。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool BPlusTree::GetValue(const GenericKey *key, std::vector<RowId> &result, Txn *transaction) {
+  if(IsEmpty()) {
+    return false;
+  }
+  LeafPage *leaf_node = reinterpret_cast<LeafPage *>(FindLeafPage(key, root_page_id_, false)->GetData());
+  RowId value;
+  bool find = leaf_node->Lookup(key, value, processor_);
+  if(find) {
+    result.push_back(value);
+  }
+  buffer_pool_manager_->UnpinPage(leaf_node->GetPageId(), false);
+  return find;
+}
+\end{minted}
+
+\subsubsection*{Insertion}
+\paragraph{Insert}
+插入一个key-value键值对，如果是个空树，那么直接插入到根结点中，否则调用插入到叶子结点的函数。返回值代表是否插入重复key，我们是不允许插入重复key的。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool BPlusTree::Insert(GenericKey *key, const RowId &value, Txn *transaction) {
+  if(IsEmpty()) {
+    StartNewTree(key, value);
+    return true;
+  }
+  return InsertIntoLeaf(key, value, transaction);
+}
+\end{minted}
+
+\paragraph{StartNewTree}
+如果是一个空树，那么直接插入到根结点中，这里需要创建一个新的叶子结点，然后将新的叶子结点的page\_id写入到元数据页中。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+void BPlusTree::StartNewTree(GenericKey *key, const RowId &value) {
+  Page *page = buffer_pool_manager_->NewPage(root_page_id_);
+  ASSERT(page != nullptr, "out of memory");
+  LeafPage *leaf_page = reinterpret_cast<LeafPage *>(page->GetData());
+  leaf_page->Init(root_page_id_, INVALID_PAGE_ID, processor_.GetKeySize(), leaf_max_size_);
+  leaf_page->Insert(key, value, processor_);
+  buffer_pool_manager_->UnpinPage(root_page_id_, true);
+  UpdateRootPageId(0);
+}
+\end{minted}
+
+\paragraph{InsertIntoLeaf}
+插入一个key-value键值对到叶子结点中，如果叶子结点的size超过了最大值，那么需要进行split操作，将一半的key和value移动到另一个新的叶子结点中，然后将新的key和value插入到叶子结点中，然后将新的叶子插到parent中。
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+bool BPlusTree::InsertIntoLeaf(GenericKey *key, const RowId &value, Txn *transaction) {
+  static int count = 0;
+  Page *leaf_page = FindLeafPage(key, root_page_id_, false);
+  LeafPage *leaf_node = reinterpret_cast<LeafPage *>(leaf_page->GetData());
+  RowId receive_value;
+  if(leaf_node->Lookup(key, receive_value, processor_)) {
+    cout << "Duplicate key" << endl;
+    buffer_pool_manager_->UnpinPage(leaf_node->GetPageId(), false);
+    return false;
+  }
+  if(leaf_node->GetSize() < leaf_node->GetMaxSize()) {
+    leaf_node->Insert(key, value, processor_);
+    buffer_pool_manager_->UnpinPage(leaf_node->GetPageId(), true);
+  }else{
+    // deal with split
+    LeafPage *new_leaf_node = Split(leaf_node, transaction);
+    if(processor_.CompareKeys(key, new_leaf_node->KeyAt(0)) < 0) {
+      leaf_node->Insert(key, value, processor_);
+    }else{
+      new_leaf_node->Insert(key, value, processor_);
+    }
+    InsertIntoParent(leaf_node, new_leaf_node->KeyAt(0), new_leaf_node, transaction);
+    buffer_pool_manager_->UnpinPage(leaf_node->GetPageId(), true);
+    buffer_pool_manager_->UnpinPage(new_leaf_node->GetPageId(), true);
+  } 
+  return true; 
+}
+\end{minted}
+
+\paragraph{Split}
+这一部分包含叶子结点和中间结点的split操作，首先创建一个新的叶子结点或者中间结点，然后将当前结点的一半key和value移动到新的结点中，然后返回新的结点。叶子结点需要更新next\_page\_id，中间结点需要更新子节点的parent\_page\_id。
+这里的实现依赖于前面结点页的实现，
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+BPlusTreeInternalPage *BPlusTree::Split(InternalPage *node, Txn *transaction) {
+  page_id_t new_page_id;
+  Page *page = buffer_pool_manager_->NewPage(new_page_id);
+  ASSERT(page != nullptr, "out of memory");
+  InternalPage *new_internal_page = reinterpret_cast<InternalPage *>(page->GetData());
+  new_internal_page->Init(new_page_id, node->GetParentPageId(), processor_.GetKeySize(), internal_max_size_);
+  node->MoveHalfTo(new_internal_page, buffer_pool_manager_);
+  return new_internal_page;
+}
+
+BPlusTreeLeafPage *BPlusTree::Split(LeafPage *node, Txn *transaction) {
+  page_id_t new_page_id;
+  Page *page = buffer_pool_manager_->NewPage(new_page_id);
+  ASSERT(page != nullptr, "out of memory");
+  LeafPage *new_leaf_page = reinterpret_cast<LeafPage *>(page->GetData());
+  new_leaf_page->Init(new_page_id, node->GetParentPageId(), processor_.GetKeySize(), leaf_max_size_);
+  node->MoveHalfTo(new_leaf_page);
+  new_leaf_page->SetNextPageId(node->GetNextPageId());
+  node->SetNextPageId(new_page_id);
+  return new_leaf_page;
+}
+\end{minted}
+
+\paragraph{InsertIntoParent}
+插入一个key和value到父节点中，如果此时的结点已经是根节点了，那么就要新建一个根节点作为父节点，然后将原来的根节点和新的结点插入到新的根节点中，然后更新根节点的page\_id。
+否则就可以根据父节点的size判断是否可以插入，如果不能插入就需要进行split操作，然后递归调用InsertIntoParent函数，直到插入成功。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+void BPlusTree::InsertIntoParent(BPlusTreePage *old_node, GenericKey *key, BPlusTreePage *new_node, Txn *transaction) {
+  if(old_node->IsRootPage()) {
+    page_id_t new_page_id;
+    Page *page = buffer_pool_manager_->NewPage(new_page_id);
+    ASSERT(page != nullptr, "out of memory"); 
+    InternalPage *new_root_node = reinterpret_cast<InternalPage *>(page->GetData());
+    new_root_node->Init(new_page_id, INVALID_PAGE_ID, processor_.GetKeySize(), internal_max_size_);
+    new_root_node->PopulateNewRoot(old_node->GetPageId(), key, new_node->GetPageId());
+    old_node->SetParentPageId(new_page_id);
+    new_node->SetParentPageId(new_page_id);
+    root_page_id_ = new_page_id;
+    UpdateRootPageId(0);
+    buffer_pool_manager_->UnpinPage(new_page_id, true);
+  }else{
+    page_id_t page_id = old_node->GetParentPageId();
+    Page *page = buffer_pool_manager_->FetchPage(page_id);
+    InternalPage *parent_node = reinterpret_cast<InternalPage *>(page->GetData());
+    if(parent_node->GetSize() < parent_node->GetMaxSize()) {
+      parent_node->InsertNodeAfter(old_node->GetPageId(), key, new_node->GetPageId());
+      new_node->SetParentPageId(page_id);
+      buffer_pool_manager_->UnpinPage(page_id, true);
+    }else{
+      InternalPage *new_internal_node = Split(parent_node, transaction);
+      if(processor_.CompareKeys(key, new_internal_node->KeyAt(0)) < 0) {
+        new_node->SetParentPageId(page_id);
+        parent_node->InsertNodeAfter(old_node->GetPageId(), key, new_node->GetPageId());
+      }else{
+        new_node->SetParentPageId(new_internal_node->GetPageId());
+        new_internal_node->InsertNodeAfter(old_node->GetPageId(), key, new_node->GetPageId());
+      }
+      InsertIntoParent(parent_node, new_internal_node->KeyAt(0), new_internal_node, transaction);
+      buffer_pool_manager_->UnpinPage(parent_node->GetPageId(), true);
+      buffer_pool_manager_->UnpinPage(new_internal_node->GetPageId(), true);
+    }
+  }
+}
+\end{minted}
+
+\subsubsection*{Deletion}
+插入的过程中需要分裂，删除的过程中则需要合并和重分配。下面是各个接口的具体实现：
+
+\paragraph{Remove}
+如果是空树的话，直接返回false，否则找到leaf后调用RemoveAndDeleteRecord函数，如果删除后叶子结点的size小于最小值，那么需要进行合并或者重分配操作。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+void BPlusTree::Remove(const GenericKey *key, Txn *transaction) {
+  if(IsEmpty()) {
+    return;
+  }
+  Page* page = FindLeafPage(key, root_page_id_, false);
+  LeafPage *leaf_node = reinterpret_cast<LeafPage *>(page->GetData());
+  int new_size = leaf_node->RemoveAndDeleteRecord(key, processor_);
+  if(new_size < leaf_node->GetMinSize()) {
+    if(CoalesceOrRedistribute(leaf_node, transaction)) {
+      buffer_pool_manager_->UnpinPage(leaf_node->GetPageId(), false);
+      buffer_pool_manager_->DeletePage(leaf_node->GetPageId());
+    }else{
+      buffer_pool_manager_->UnpinPage(leaf_node->GetPageId(), true);
+    }
+  }else{
+    buffer_pool_manager_->UnpinPage(leaf_node->GetPageId(), true);
+  }
+}
+\end{minted}
+
+\paragraph{CoalesceOrRedistribute}
+这里使用模板实现了合并和重分配操作，如果叶子结点的size小于最小值，那么需要进行合并或者重分配操作。合并的条件是兄弟节点与自身的size之和小于最大值，
+我们的实现逻辑是优先实现重分配，如果重分配失败，那么就进行合并操作，合并操作需要递归调用CoalesceOrRedistribute函数，直到合并成功。这里返回值的
+意义是要删除的叶子节点所在的page是否要删除，即是否发生了合并。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+  template <typename N>
+bool BPlusTree::CoalesceOrRedistribute(N *&node, Txn *transaction) {
+  if (node->IsRootPage()) {
+    return AdjustRoot(node);
+  }
+  auto parent = reinterpret_cast<InternalPage *>(buffer_pool_manager_->FetchPage(node->GetParentPageId())->GetData());
+  int index = parent->ValueIndex(node->GetPageId());
+  page_id_t sibilings = index == 0 ? parent->ValueAt(1) : parent->ValueAt(index - 1);
+  auto sibilings_page = reinterpret_cast<N *>(buffer_pool_manager_->FetchPage(sibilings)->GetData());
+  if(node->GetSize() + sibilings_page->GetSize() > node->GetMaxSize()) {
+    Redistribute(sibilings_page, node, index);
+    buffer_pool_manager_->UnpinPage(sibilings_page->GetPageId(), true);
+    buffer_pool_manager_->UnpinPage(node->GetPageId(), true);
+    return false;
+  }else{
+    if(Coalesce(sibilings_page, node, parent, index, transaction)) {
+      if(parent->IsRootPage()) {
+        if(AdjustRoot(parent)) {
+          buffer_pool_manager_->UnpinPage(parent->GetPageId(), false);
+          buffer_pool_manager_->DeletePage(parent->GetPageId());
+        } else{
+          buffer_pool_manager_->UnpinPage(parent->GetPageId(), true);
+        }
+      }else{
+        if(CoalesceOrRedistribute(parent, transaction)) {
+          buffer_pool_manager_->UnpinPage(parent->GetPageId(), false);
+          buffer_pool_manager_->DeletePage(parent->GetPageId());
+        } else{
+          buffer_pool_manager_->UnpinPage(parent->GetPageId(), true);
+        }
+      }
+    }else{
+      buffer_pool_manager_->UnpinPage(parent->GetPageId(), true);
+    }
+    return true;
+  }
+}
+\end{minted}
+
+\paragraph{Coalesce}
+合并操作，将兄弟节点的key和value移动到自身，这里调用了MoveAllTo函数，根据index判断合并的方向，是合并到兄弟还是合并到自身，然后调用MoveAllTo函数。
+这里的操作也可以通过模板完成。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+bool BPlusTree::Coalesce(LeafPage *&neighbor_node, LeafPage *&node, InternalPage *&parent, int index,
+                         Txn *transaction) {
+  if(index == 0){
+    neighbor_node->MoveAllTo(node);
+    LeafPage *temp = neighbor_node;
+    neighbor_node = node;
+    node = temp;
+    parent->Remove(1);
+  }else{
+    node->MoveAllTo(neighbor_node);
+    parent->Remove(index);
+  }
+  return parent->GetSize() < parent->GetMinSize();
+}
+
+bool BPlusTree::Coalesce(InternalPage *&neighbor_node, InternalPage *&node, InternalPage *&parent, int index,
+                         Txn *transaction) {
+  if(index == 0){
+    neighbor_node->MoveAllTo(node, parent->KeyAt(1), buffer_pool_manager_);
+    node->MoveAllTo(neighbor_node, parent->KeyAt(0), buffer_pool_manager_);
+  }else{
+    node->MoveAllTo(neighbor_node, parent->KeyAt(index), buffer_pool_manager_);
+  }
+  parent->Remove(index);
+  return parent->GetSize() < parent->GetMinSize();
+}
+\end{minted}
+
+\paragraph{Redistribute}
+重分配操作，将兄弟节点的key和value移动到自身，这里调用了MoveFirstToEndOf和MoveLastToFrontOf函数，将兄弟节点的第一个key和value移动到自身的最后一个位置，或者将兄弟节点的最后一个key和value移动到自身的第一个位置。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+void BPlusTree::Redistribute(LeafPage *neighbor_node, LeafPage *node, int index) {
+  auto parent = reinterpret_cast<InternalPage *>(buffer_pool_manager_->FetchPage(node->GetParentPageId())->GetData());
+  if(index == 0){
+    neighbor_node->MoveFirstToEndOf(node);
+    parent->SetKeyAt(1, neighbor_node->KeyAt(0));
+  }else{
+    neighbor_node->MoveLastToFrontOf(node);
+    parent->SetKeyAt(index, node->KeyAt(0));
+  }
+  buffer_pool_manager_->UnpinPage(parent->GetPageId(), true);
+}
+void BPlusTree::Redistribute(InternalPage *neighbor_node, InternalPage *node, int index) {
+  auto parent = reinterpret_cast<InternalPage *>(buffer_pool_manager_->FetchPage(node->GetParentPageId())->GetData());
+  if(index == 0){
+    neighbor_node->MoveFirstToEndOf(node, parent->KeyAt(1), buffer_pool_manager_);
+    parent->SetKeyAt(1, neighbor_node->KeyAt(0));
+  }else{
+    neighbor_node->MoveLastToFrontOf(node, parent->KeyAt(index), buffer_pool_manager_);
+    parent->SetKeyAt(index, node->KeyAt(0));
+  }
+  buffer_pool_manager_->UnpinPage(parent->GetPageId(), true);
+}
+\end{minted}
+
+\paragraph{AdjustRoot}
+在前面合并结点后，如果父节点是根节点的话，需要对下面两种情况进行处理：第一是删除了根节点的最后一个元素，但是根节点还有一个子节点；第二是根节点是最后一个节点了，那么就是删除整个b+树。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+bool BPlusTree::AdjustRoot(BPlusTreePage *old_root_node) {
+  // case 1: when you delete the last element in root page, but root page still has one last child
+  if(old_root_node->GetSize() == 1 && !old_root_node->IsLeafPage()){
+    InternalPage *old_page = reinterpret_cast<InternalPage *>(old_root_node);
+    page_id_t child_page_id = old_page->RemoveAndReturnOnlyChild();
+    Page *child_page = buffer_pool_manager_->FetchPage(child_page_id);
+    BPlusTreePage *child_node = reinterpret_cast<BPlusTreePage *>(child_page->GetData());
+    child_node->SetParentPageId(INVALID_PAGE_ID);
+    root_page_id_ = child_page_id;
+    UpdateRootPageId(0);
+    buffer_pool_manager_->UnpinPage(child_page_id, true);
+    return true;
+  }
+  // case 2: delete the last element in whole b+ tree,
+  if(old_root_node->GetSize() == 0 && old_root_node->IsLeafPage() ){
+    root_page_id_ = INVALID_PAGE_ID;
+    UpdateRootPageId(0);
+    return true;
+  }
+  return false;
+}
+\end{minted}
+
+\subsection{IndexIterator}
+
+前面我们已经实现了整个b+树的创建和插入删除查找的功能。现在我们实现迭代器，用于遍历b+树中的叶子节点的元素。
+
+\subsubsection{IndexIterator implementation}
+
+\paragraph{IndexIterator} 
+这里是使用page\_id,BufferPoolManager,index创建的迭代器，默认的构造函数就是一个空的迭代器。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+IndexIterator::IndexIterator() = default;
+
+IndexIterator::IndexIterator(page_id_t page_id, BufferPoolManager *bpm, int index)
+    : current_page_id(page_id), item_index(index), buffer_pool_manager(bpm) {
+      if(current_page_id != INVALID_PAGE_ID)
+        page = reinterpret_cast<LeafPage *>(buffer_pool_manager->FetchPage(current_page_id)->GetData());
+}
+\end{minted}
+
+\paragraph{~IndexIterator}
+析构函数，用于释放迭代器的资源，这里需要释放page，因为每个迭代器都在构造时候fetch了一个page。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+IndexIterator::~IndexIterator() {
+  if (current_page_id != INVALID_PAGE_ID)
+    buffer_pool_manager->UnpinPage(current_page_id, false);
+}
+\end{minted}
+
+\paragraph{operator*}
+*操作符，返回当前迭代器指向的元素，这里调用了page的KeyAt和ValueAt函数。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+std::pair<GenericKey *, RowId> IndexIterator::operator*() {
+  return std::make_pair(page->KeyAt(item_index), page->ValueAt(item_index));
+}
+\end{minted}
+
+\paragraph{operator++}
+++操作符，用于迭代器的自增，这里需要判断是否到达了叶子结点的末尾，如果到达了叶子结点的末尾，那么需要将当前的page释放，然后将page指向下一个叶子结点。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+IndexIterator &IndexIterator::operator++() {
+  if (item_index + 1 < page->GetSize()) {
+    item_index++;
+  } else {
+    page_id_t next_page_id = page->GetNextPageId();
+    buffer_pool_manager->UnpinPage(current_page_id, false);
+    current_page_id = next_page_id;
+    if (current_page_id != INVALID_PAGE_ID) {
+      page = reinterpret_cast<LeafPage *>(buffer_pool_manager->FetchPage(current_page_id)->GetData());
+      item_index = 0;
+    } else{
+      page = nullptr;
+      current_page_id = INVALID_PAGE_ID;
+      item_index = 0;
+    }
+  }
+  return *this;
+}
+\end{minted}
+
+\paragraph{operator==}
+==操作符，用于判断两个迭代器是否相等，这里需要判断两个迭代器的page\_id和item\_index是否相等。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+bool IndexIterator::operator==(const IndexIterator &itr) const {
+  return current_page_id == itr.current_page_id && item_index == itr.item_index;
+}
+\end{minted}
+
+\paragraph{operator!=}
+!=操作符，用于判断两个迭代器是否不相等，这里调用了==操作符。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+bool IndexIterator::operator!=(const IndexIterator &itr) const {
+  return !(*this == itr);
+}
+\end{minted}
+
+\subsubsection{BPlusTree IndexIterator}
+
+\paragraph{Begin}
+返回一个迭代器，指向b+树的第一个元素，这里需要找到b+树的第一个叶子结点，然后返回一个迭代器，指向第一个叶子结点的第一个元素。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+IndexIterator BPlusTree::Begin() {
+  page_id_t page_id = root_page_id_;
+  Page *page = buffer_pool_manager_->FetchPage(page_id);
+  BPlusTreePage *node = reinterpret_cast<BPlusTreePage *>(page->GetData());
+  while(!node->IsLeafPage()) {
+    InternalPage *internal_node = reinterpret_cast<InternalPage *>(node);
+    page_id = internal_node->ValueAt(0);
+    buffer_pool_manager_->UnpinPage(node->GetPageId(), false);
+    node = reinterpret_cast<BPlusTreePage *>(buffer_pool_manager_->FetchPage(page_id)->GetData());
+  }
+  return IndexIterator(page_id, buffer_pool_manager_);
+}
+\end{minted}
+
+另外，Begin函数有一个overload版本，可以指定一个key，返回一个迭代器，指向第一个大于等于key的元素。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+IndexIterator BPlusTree::Begin(const GenericKey *key) {
+  Page * page = FindLeafPage(key, root_page_id_, false);
+  if(page == nullptr){
+    return IndexIterator();
+  }
+  LeafPage *node = reinterpret_cast<LeafPage *>(page->GetData());
+  int index = node->KeyIndex(key, processor_);
+  buffer_pool_manager_->UnpinPage(node->GetPageId(), false);
+  return IndexIterator(node->GetPageId(), buffer_pool_manager_, index);
+}
+\end{minted}
+
+\paragraph{End}
+返回一个迭代器，根据迭代器的定义，应当是一个空的迭代器。
+\begin{minted}
+  [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+  ]{cpp}
+IndexIterator BPlusTree::End() {
+  return IndexIterator();
+}
+\end{minted}
+
+\subsection{Test}
+
+使用框架提供的测试进行测试，其中BPlusTreeTests测试的n达到1e6，测试结果如下：
+
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}
+    \centering
+    \includegraphics[width=.8\linewidth]{figures/test7.png}
+    \caption{test7}
+    \label{fig:test7}
+  \end{subfigure}
+  \begin{subfigure}
+    \centering
+    \includegraphics[width=.8\linewidth]{figures/test8.png}
+    \caption{test8}
+    \label{fig:test8}
+  \end{subfigure}
+  \begin{subfigure}
+    \centering
+    \includegraphics[width=.8\linewidth]{figures/test9.png}
+    \caption{test9}
+    \label{fig:test9}
+  \end{subfigure}
+\end{figure}
+
+本节测试全部通过。
+
+\tbox{
+  所给的测试样例只进行了一半的删除，我添加了剩余一半的删除测试，否则AdjustRoot函数无法测试。
+}
+\pagebreak
+\section{Summary}
+
+我还负责对系统全部实现后进行了测试，具体的测试在验收时都已经演示过了，这里就不再赘述。至此，我个人完成的部分已经全部实现并通过了测试。对于我完成的部分，b+树的部分是问题
+最大的，后续系统功能的测试中出问题的地方也几乎都是索引引发的，经过了漫长的调试，最终得到了一个可以使用的版本。对于这样的大型工程，单元测试的完善可以帮助我们更好地实现整体
+的功能，我认为目前框架内提供的单元测试还不足以完全测试代码的正确性。在tableheap这一部分可以说几乎没有测试，这些单元测试的不完备导致我们在后面的程序调试中需要往前寻找问题
+而这一过程是十分困难而且耗时的。我希望能够把我完善的部分测试（lab2,3）的单元测试加入到框架中，这样可以更好地帮助我们调试程序。也希望未来框架能够越来越好，现在有一些地方的
+说明也不是很清晰，比如destroy函数的默认值，这样的设计在文档中没有提及，导致了很多的困扰。报告的撰写也花费了不少的精力，感谢能看到这里的助教老师，希望我们数据库系统这门课
+能越来越好，也希望这样一个巨大工作量和难度的大程能在考核中获得更多的分数，而不是仅仅15分。
+
+\end{document}

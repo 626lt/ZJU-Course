@@ -1,3 +1,9 @@
+*.aux
+
+*.out
+
+*.toc
+
 *.xpr
 
 *.log
@@ -11,3 +17,21 @@ __MACOSX
 .DS_Store
 
 *.ppt
+
+*.cache
+
+*.hw
+
+*.ip_user_files
+
+*.sim
+
+*.xpr
+
+*.vscode
+
+*.png
+
+*.jpg
+
+minisql
