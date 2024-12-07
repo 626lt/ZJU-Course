@@ -1,0 +1,107 @@
+%!TeX program = xelatex
+\documentclass[12pt,hyperref,a4paper,UTF8]{ctexart}
+\usepackage{zjureport}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{tabularx}
+\usepackage{float}
+\definecolor{cmdbg}{rgb}{0.92,0.92,0.92}
+
+%%-------------------------------正文开始---------------------------%%
+\begin{document}
+
+%%-----------------------封面--------------------%%
+\cover
+
+
+\thispagestyle{empty} % 首页不显示页码
+
+%%--------------------------目录页------------------------%%
+\newpage
+\tableofcontents
+
+%%------------------------正文页从这里开始-------------------%
+\newpage
+本次作业使用两种光照模型，漫反射与镜面反射，使用 opengl 的固定管线实现了漫反射和镜面反射。
+
+\section{光照开启}
+在 opengl 中默认是关闭光照的，首先要启用光照模型，然后根据固定管线，设置光源参数，本次实验要求的是点光源。另外由于编写 shader 需要高版本的 opengl，我在本次作业中使用的是老版本的固定管线，所以对于太阳的处理是用发光材质来模拟的。
+
+\begin{minted}[    
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines
+]{cpp}
+void setupLighting(GLfloat *lightPos, GLfloat *_diffuseLight = NULL, GLfloat *_specularLight = NULL, int _num = 0) {
+    // 启用光照
+    glEnable(GL_LIGHTING);
+    int lightNum = 0;
+    lightNum = GL_LIGHT0 + _num;
+    // 启用光源
+    glEnable(lightNum);
+    // 设置光源位置
+    glLightfv(lightNum, GL_POSITION, lightPos);
+
+    // 设置漫反射光
+    if(_diffuseLight != NULL){
+        glLightfv(lightNum, GL_DIFFUSE, _diffuseLight);
+    }
+    
+    // 设置镜面反射光
+    if (_specularLight != NULL) {
+        glLightfv(lightNum, GL_SPECULAR, _specularLight);
+    }
+}
+\end{minted}
+
+\section{漫反射和镜面反射}
+根据固定管线的实现，我们提供光源参数即可，具体如下
+
+\begin{minted}[    
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines
+]{cpp}
+    setupLighting(light, NULL, specularLight, 0);
+    setupLighting(light, diffuseLight, NULL, 1);
+\end{minted}
+
+下面是实现的结果
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{./figures/2024-12-04-14-39-24.png}
+    \caption{漫反射}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{./figures/2024-12-04-14-40-04.png}
+    \caption{镜面反射}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{./figures/2024-12-04-14-40-33.png}
+    \caption{漫反射和镜面反射}
+\end{figure}
+
+在最后的效果图中，我们可以看到两种反射的效果都在其中，光照设置的效果还是不错的。
+
+但是由于固定管线的限制，对于中心太阳的设置就比较简陋了
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{./figures/2024-12-04-14-42-05.png}
+    \caption{太阳}
+\end{figure}
+
+\section{总结}
+
+本次作业使用固定管线完成了光照设置，但是新老版本的opengl不兼容，会出现一些问题，本次作业使用简单材质模拟了太阳的光照效果，但是效果不是很好，在大作业中应该会改进效果。
+
+\end{document}

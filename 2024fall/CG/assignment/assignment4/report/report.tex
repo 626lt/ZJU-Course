@@ -1,0 +1,301 @@
+%!TeX program = xelatex
+\documentclass[12pt,hyperref,a4paper,UTF8]{ctexart}
+\usepackage{zjureport}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{framed}
+\usepackage{xcolor}
+\usepackage{media9}
+
+\definecolor{cmdbg}{rgb}{0.92,0.92,0.92}
+\definecolor{shadecolor}{gray}{0.9}
+
+%%-------------------------------正文开始---------------------------%%
+\begin{document}
+
+%%-----------------------封面--------------------%%
+\cover
+
+
+\thispagestyle{empty} % 首页不显示页码
+
+%%--------------------------目录页------------------------%%
+\newpage
+\tableofcontents
+
+%%------------------------正文页从这里开始-------------------%
+\newpage
+\section{需求分析}
+首先分析需求
+
+\begin{shaded*}
+    \begin{enumerate}
+        \item 2 suns,2+ planets,1+ satellite 
+        \item Planets orbit around the sun 
+        \item Satellites orbit around its planet 
+        \item Trajectories are not co-planar 
+        \item Navigation in the system (3D viewing) 
+    \end{enumerate}
+\end{shaded*}
+
+要求 5 个星球，其中 2 个为太阳，2 个为行星，1 个为卫星。行星绕太阳公转，卫星绕行星公转，轨迹不在同一平面上。要求能够在系统中导航（3D 视图）。接着逐个分析如何实现。
+
+\paragraph{2 suns,2+ planets,1+ satellite}
+确定颜色，大小，绘制实心球即可。
+
+\paragraph{orbit around}
+这里要求绕某个中心旋转，实现这种动画通过每一帧旋转一定角度即可。通过角度变量随时间变化实现。
+
+\paragraph{Trajectories are not co-planar}
+要求轨迹不在同一平面上，就是要求在动的同时做一个旋转，绕另一个轴旋转一定角度即可。
+
+\paragraph{Navigation in the system}
+这里的要求是调整视角，可以通过调整 camera 的位置和朝向实现。
+
+\section{代码实现}
+\subsection{定义变量}
+在上面的分析中，我们将具体的需求分解成了离散的元素，据此我们可以确定一些需要的变量。
+\paragraph{常量}
+星球的大小，颜色，轨道半径，旋转速度，轨道角度
+\paragraph{变量}
+摄影机的位置，朝向，鼠标灵敏度，是否旋转
+
+\subsection{绘制图形}
+需要绘制轨道、星球，分别用如下实现：
+\begin{minted}[    
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines
+]{cpp}
+void star(const float* color, const float* sphere)
+{
+    glColor3f(color[0], color[1], color[2]);
+    glutSolidSphere(sphere[0], sphere[1], sphere[2]);
+}
+
+void orbit(const int radius)
+{
+    #ifdef ORBIT
+    glBegin(GL_LINE_LOOP);
+    glColor3f(colorOfOrbit[0],colorOfOrbit[1],colorOfOrbit[2]);
+    for(int i = 0; i < 360; i++)
+    {
+        float theta = i * M_PI / 180;
+        glVertex3f(radius * cos(theta), 0.0, radius * sin(theta));
+    }
+    glEnd();
+    #endif
+    return;
+}
+\end{minted}
+
+确定颜色后使用 \texttt{glColor3f} 设置颜色，使用 \texttt{glutSolidSphere} 绘制实心球。轨道的绘制使用点绘制圆形。添加了是否需要绘制轨道的宏定义，可以在编译时选择是否绘制轨道。
+
+\subsection{组合图形}
+上面我们已经有了基本的图形元素，现在通过 \texttt{display} 来将这些图形排列与显示。在函数中，设置是否转动，摄影位置以及角度，然后绘制星球和轨道。
+
+\begin{minted}[    
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines
+]{cpp}
+void display(){
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // 清除颜色缓冲区和深度缓冲区
+    if(rotate) angle += 3; // angle 更新才能开始转动，这里的 3 也是代表基本转动速度
+    glLoadIdentity();
+    gluLookAt(eyePosition[0], eyePosition[1], eyePosition[2], 0.0, 0.0, 0.0, 0.0, 1.0, 0.0); // 设置摄像机位置
+    // 设置摄像机角度，围绕x轴和y轴旋转
+    glRotated(camera_angle_v, 1.0, 0.0, 0.0); 
+    glRotated(camera_angle_h, 0.0, 1.0, 0.0);
+    // solar system 1
+    glPushMatrix();
+    {
+        glRotatef(angle * speedOfSun, 0.0, 1.0, 0.0); // 公转
+        orbit(orbitOfSun); // 太阳轨道
+        glTranslatef(orbitOfSun, 0.0, 0.0); // 太阳位置
+        star(colorOfSun, sphereOfSun); // 太阳
+        // planet 1
+        glPushMatrix();
+        {
+            glRotatef(angleOfPlanet1, 0.0, 0.0, 1.0); // 轨道调整
+            glRotatef(angle * speedOfPlanet1, 0.0, 1.0, 0.0); // 行星1公转
+            orbit(orbitOfPlanet1); // 行星1轨道
+            glTranslatef(orbitOfPlanet1, 0.0, 0.0); // 行星1位置
+            star(colorOfPlanet1, sphereOfPlanet1); // 行星1
+        }
+        glPopMatrix();
+    }
+    glPopMatrix();
+    // solar system 2
+    ...
+
+}
+\end{minted}
+
+上面展示了如何设置视角以及更新旋转，然后使用了 \texttt{glPushMatrix} 和 \texttt{glPopMatrix} 来保存和恢复状态，实现相对运动，其余的星球和卫星的绘制类似。
+
+\subsection{视图设置}
+在三维的图像显示中，视图的设置保证了我们能够看到我们想要的图像。调整视口、投影矩阵和模型视图矩阵，以适应新的窗口大小。
+
+\begin{minted}[    
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines
+]{cpp}
+void reshape(int w, int h) {
+    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+    glMatrixMode(GL_PROJECTION); // 设置投影矩阵
+    glLoadIdentity();
+    gluPerspective(60.0, (GLfloat)w / (GLfloat)h, 0.01f, 2000.0f);
+    glMatrixMode(GL_MODELVIEW); // 设置模型视图矩阵
+    glLoadIdentity();
+}
+\end{minted}
+
+\subsection{控制设置}
+为了实现在系统中导航，我们需要设置一些控制，这里使用键盘和鼠标来控制视角和旋转，接受键盘和鼠标事件，然后设置相应的变量。
+
+\begin{minted}[    
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines
+]{cpp}
+void onKeyboard(unsigned char key, int x, int y) {
+    switch (key){
+        case 'r':
+            rotate = !rotate;
+            break;
+        case 27:
+            exit(0);
+            break;
+        case 'w':
+            eyePosition[1] += 10;
+            break;
+        case 's':
+            eyePosition[1] -= 10;
+            break;
+        case 'a':
+            eyePosition[0] -= 10;
+            break;
+        case 'd':
+            eyePosition[0] += 10;
+            break;
+        default:
+            break;
+    }
+}
+
+void onSpecialKey(int key, int x, int y) {
+    switch (key){
+        case GLUT_KEY_UP:
+            eyePosition[2] -= 10;
+            break;
+        case GLUT_KEY_DOWN:
+            eyePosition[2] += 10;
+            break;
+        default:
+            break;
+    }
+}
+\end{minted}
+
+键盘主要用于控制是否旋转，退出，上下左右移动，控制摄影机的位置。
+
+\begin{minted}[    
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines
+]{cpp}
+void mouseButton(int button, int state, int x, int y){
+    if(button == GLUT_LEFT_BUTTON){
+        if(state == GLUT_DOWN){
+            Dragging = true;
+            drag_x_origin = x;
+            drag_y_origin = y;
+        }
+        else{
+            Dragging = false;
+        }
+    }
+}
+
+void mouseMove(int x, int y){
+    if(Dragging){
+        camera_angle_h += (x - drag_x_origin) * mouse_sensitivity;
+        camera_angle_v += (y - drag_y_origin) * mouse_sensitivity;
+        drag_x_origin = x;
+        drag_y_origin = y;
+    }
+    return;
+}
+\end{minted}
+
+鼠标主要用于控制视角，左键按下时记录当前位置，移动时计算移动距离，更新视角。
+
+\subsection{编译运行}
+编译时需要链接 OpenGL 库，在 darwin 和 linux 下，链接的库不同，在程序和编译指令中都做了适配
+
+\begin{minted}[    
+    linenos,
+    breaklines,
+    bgcolor = cmdbg,
+    fontsize=\footnotesize,
+    frame=lines
+]{makefile}
+ifeq ($(UNAME_S), Linux)
+	LDFLAGS := -lGL -lGLU -lglut
+else ifeq ($(UNAME_S), Darwin)
+	LDFLAGS := -L/System/Library/Frameworks -framework GLUT -framework OpenGL
+else
+    $(error Unsupported platform)
+endif
+\end{minted}
+
+\begin{minted}
+    [
+        linenos,
+        breaklines,
+        bgcolor = cmdbg,
+        fontsize=\footnotesize,
+        frame=lines
+    ]{cpp}
+#if defined (__APPLE__)
+    #define GL_SILENCE_DEPRECATION
+    #include <GLUT/glut.h>
+#elif defined(_WIN32) || defined(_WIN64) || defined(__linux__)
+    #include <GL/glut.h>
+#endif
+\end{minted}
+
+编译命令为 \texttt{make all}，运行命令为 \texttt{make run}。另外提供了是否绘制轨道的选项，在编译时使用 \texttt{make all ORBIT=0} 即可。
+
+
+\section{实现效果}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{./figures/2024-10-27-16-20-54.png}
+    \caption{太阳系模拟有轨道}
+    \label{fig:solar_system}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{./figures/2024-10-29-16-03-16.png}
+    \caption{太阳系模拟无轨道}
+    \label{fig:solar_system_no_orbit}
+\end{figure}
+
+\end{document}
