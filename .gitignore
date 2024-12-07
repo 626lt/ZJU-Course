@@ -1,37 +1,25 @@
-*.aux
-
-*.out
-
-*.toc
-
 *.xpr
-
-*.log
-
-*.jou
-
-*.str
-
 __MACOSX
-
 .DS_Store
-
 *.ppt
-
+.clangd
 *.cache
-
+*.o
 *.hw
-
-*.ip_user_files
-
-*.sim
-
-*.xpr
 
 *.vscode
 
 *.png
 
-*.jpg
 
 minisql
+
+*.aux 
+*.log 
+*.toc 
+*.out 
+*.lof 
+*.lot 
+*.bbl 
+*.blg 
+*.synctex.gz
